@@ -1,0 +1,751 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * FormNull — Form Builder (Phase 2)
+     5→ * =====================================================================
+     6→ * The manual form builder. THE SOURCE OF TRUTH for form structure.
+     7→ *
+     8→ * Real Supabase persistence:
+     9→ *   - Form load:      SELECT forms + form_fields (sorted by sort_order)
+    10→ *   - Form save:      UPDATE forms (name, description)
+    11→ *   - Form delete:    DELETE forms (cascades fields + submissions via FK)
+    12→ *   - Add field:      INSERT form_fields (immediate, sort_order = max+1)
+    13→ *   - Edit field:     UPDATE form_fields (explicit Save per field)
+    14→ *   - Delete field:   DELETE form_fields (cascades submission_values via FK)
+    15→ *   - Reorder:        UPDATE sort_order for CHANGED rows only, once per
+    16→ *                     drop / button press (no writes during dragging)
+    17→ *
+    18→ * No fake success: every mutation awaits the real Supabase response and
+    19→ * only updates UI state after the database confirms. Failures surface
+    20→ * real errors and preserve unsaved local work.
+    21→ *
+    22→ * RLS: all queries run as the authenticated user — readers must be
+    23→ * workspace members, writers editors+. An unauthorized form id simply
+    24→ * returns no row ("Form not found").
+    25→ */
+    26→import { useCallback, useEffect, useMemo, useState } from "react";
+    27→import Link from "next/link";
+    28→import { useRouter } from "next/navigation";
+    29→import { toast } from "sonner";
+    30→import {
+    31→  DndContext,
+    32→  closestCenter,
+    33→  PointerSensor,
+    34→  TouchSensor,
+    35→  useSensor,
+    36→  useSensors,
+    37→  type DragEndEvent,
+    38→} from "@dnd-kit/core";
+    39→import {
+    40→  SortableContext,
+    41→  verticalListSortingStrategy,
+    42→  useSortable,
+    43→  arrayMove,
+    44→} from "@dnd-kit/sortable";
+    45→import { CSS } from "@dnd-kit/utilities";
+    46→import { Button } from "@/components/ui/button";
+    47→import { Input } from "@/components/ui/input";
+    48→import { Label } from "@/components/ui/label";
+    49→import { Textarea } from "@/components/ui/textarea";
+    50→import {
+    51→  EmptyState,
+    52→  ErrorState,
+    53→  LoadingState,
+    54→} from "@/components/formnull/states";
+    55→import {
+    56→  GeometricCircle,
+    57→  GeometricTriangle,
+    58→} from "@/components/memphis/memphis-decorations";
+    59→import { supabaseBrowser } from "@/lib/supabase/client";
+    60→import type { Database, FieldType } from "@/lib/supabase/types";
+    61→import {
+    62→  ArrowLeft,
+    63→  Trash2,
+    64→  FileText,
+    65→  ChevronUp,
+    66→  ChevronDown,
+    67→  Pencil,
+    68→  GripVertical,
+    69→  ChevronDown as ChevronIcon,
+    70→} from "lucide-react";
+    71→import { cn } from "@/lib/utils";
+    72→import { FIELD_TYPES_BY_GROUP, fieldLabel } from "./field-types";
+    73→import { FieldEditor } from "./field-editor";
+    74→
+    75→type FormRow = Database["public"]["Tables"]["forms"]["Row"];
+    76→type FormField = Database["public"]["Tables"]["form_fields"]["Row"];
+    77→
+    78→/* ------------------------------------------------------------------ */
+    79→/* field_key generation — unique per form                              */
+    80→/* ------------------------------------------------------------------ */
+    81→
+    82→function slugify(s: string): string {
+    83→  return (
+    84→    s
+    85→      .toLowerCase()
+    86→      .trim()
+    87→      .replace(/[^a-z0-9]+/g, "_")
+    88→      .replace(/^_+|_+$/g, "")
+    89→      .slice(0, 50) || "field"
+    90→  );
+    91→}
+    92→
+    93→function uniqueKey(label: string, existing: string[]): string {
+    94→  const base = slugify(label);
+    95→  if (!existing.includes(base)) return base;
+    96→  let i = 2;
+    97→  while (existing.includes(`${base}_${i}`)) i += 1;
+    98→  return `${base}_${i}`;
+    99→}
+   100→
+   101→/* ------------------------------------------------------------------ */
+   102→/* FormDetail (builder)                                                */
+   103→/* ------------------------------------------------------------------ */
+   104→
+   105→export function FormDetail({ formId }: { formId: string }) {
+   106→  const router = useRouter();
+   107→  const [form, setForm] = useState<FormRow | null>(null);
+   108→  const [fields, setFields] = useState<FormField[]>([]);
+   109→  const [loading, setLoading] = useState(true);
+   110→  const [loadError, setLoadError] = useState<string | null>(null);
+   111→
+   112→  // Form-level editing
+   113→  const [name, setName] = useState("");
+   114→  const [description, setDescription] = useState("");
+   115→  const [savingForm, setSavingForm] = useState(false);
+   116→  const [deleting, setDeleting] = useState(false);
+   117→
+   118→  // Field-level editing
+   119→  const [editingFieldId, setEditingFieldId] = useState<string | null>(null);
+   120→  const [savingFieldId, setSavingFieldId] = useState<string | null>(null);
+   121→  const [addingField, setAddingField] = useState<string | null>(null);
+   122→  const [deletingFieldId, setDeletingFieldId] = useState<string | null>(null);
+   123→  const [reorderError, setReorderError] = useState<string | null>(null);
+   124→
+   125→  const fieldIds = useMemo(() => fields.map((f) => f.id), [fields]);
+   126→
+   127→  const load = useCallback(async () => {
+   128→    setLoading(true);
+   129→    setLoadError(null);
+   130→    try {
+   131→      const [formRes, fieldsRes] = await Promise.all([
+   132→        supabaseBrowser.from("forms").select("*").eq("id", formId).maybeSingle(),
+   133→        supabaseBrowser
+   134→          .from("form_fields")
+   135→          .select("*")
+   136→          .eq("form_id", formId)
+   137→          .order("sort_order", { ascending: true }),
+   138→      ]);
+   139→
+   140→      if (formRes.error) throw formRes.error;
+   141→      if (!formRes.data) {
+   142→        setForm(null);
+   143→        setLoadError("Form not found, or you don't have access to it.");
+   144→        setLoading(false);
+   145→        return;
+   146→      }
+   147→      setForm(formRes.data);
+   148→      setName(formRes.data.name);
+   149→      setDescription(formRes.data.description ?? "");
+   150→
+   151→      if (fieldsRes.error) throw fieldsRes.error;
+   152→      setFields((fieldsRes.data as FormField[]) ?? []);
+   153→    } catch (e) {
+   154→      const msg = e instanceof Error ? e.message : "Failed to load form.";
+   155→      setLoadError(msg);
+   156→    } finally {
+   157→      setLoading(false);
+   158→    }
+   159→  }, [formId]);
+   160→
+   161→  useEffect(() => {
+   162→    load();
+   163→  }, [load]);
+   164→
+   165→  /* ---------------- Form-level mutations ---------------- */
+   166→
+   167→  async function saveForm() {
+   168→    if (!form) return;
+   169→    if (!name.trim()) {
+   170→      toast.error("Form name cannot be empty.");
+   171→      return;
+   172→    }
+   173→    setSavingForm(true);
+   174→    const { error } = await supabaseBrowser
+   175→      .from("forms")
+   176→      .update({
+   177→        name: name.trim(),
+   178→        description: description.trim() || null,
+   179→        updated_by: form.created_by,
+   180→      })
+   181→      .eq("id", form.id);
+   182→    setSavingForm(false);
+   183→    if (error) {
+   184→      toast.error("Could not save form.", { description: error.message });
+   185→      return;
+   186→    }
+   187→    toast.success("Form updated.");
+   188→    setForm({ ...form, name: name.trim(), description: description.trim() || null });
+   189→  }
+   190→
+   191→  async function deleteForm() {
+   192→    if (!form) return;
+   193→    if (!confirm(`Delete "${form.name}"? All fields and submissions will be permanently removed. This cannot be undone.`)) {
+   194→      return;
+   195→    }
+   196→    setDeleting(true);
+   197→    const { error } = await supabaseBrowser.from("forms").delete().eq("id", form.id);
+   198→    setDeleting(false);
+   199→    if (error) {
+   200→      toast.error("Could not delete form.", { description: error.message });
+   201→      return;
+   202→    }
+   203→    toast.success("Form deleted.");
+   204→    router.push("/dashboard/forms/");
+   205→    router.refresh();
+   206→  }
+   207→
+   208→  /* ---------------- Field mutations ---------------- */
+   209→
+   210→  async function addField(type: FieldType) {
+   211→    if (!form) return;
+   212→    const meta = { type, label: fieldLabel(type) };
+   213→    setAddingField(type);
+   214→    try {
+   215→      const existingKeys = fields.map((f) => f.field_key);
+   216→      const key = uniqueKey(meta.label, existingKeys);
+   217→      const nextOrder = fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
+   218→
+   219→      // Type-appropriate default config.
+   220→      const defaultConfig: Record<string, unknown> =
+   221→        type === "single_select" || type === "multi_select"
+   222→          ? { options: ["Option 1", "Option 2"] }
+   223→          : type === "rating"
+   224→            ? { max: 5 }
+   225→            : {};
+   226→
+   227→      const { data, error } = await supabaseBrowser
+   228→        .from("form_fields")
+   229→        .insert({
+   230→          form_id: form.id,
+   231→          field_key: key,
+   232→          field_type: type,
+   233→          label: meta.label,
+   234→          is_required: false,
+   235→          sort_order: nextOrder,
+   236→          width: 12,
+   237→          config: defaultConfig,
+   238→        })
+   239→        .select()
+   240→        .single();
+   241→
+   242→      if (error) throw error;
+   243→      if (!data) throw new Error("Field creation returned no row.");
+   244→
+   245→      // Real row confirmed by the database — now update the UI.
+   246→      setFields((prev) => [...prev, data as FormField]);
+   247→      setEditingFieldId(data.id);
+   248→      toast.success(`${meta.label} field added.`);
+   249→    } catch (e) {
+   250→      toast.error("Could not add field.", {
+   251→        description: e instanceof Error ? e.message : "Please try again.",
+   252→      });
+   253→    } finally {
+   254→      setAddingField(null);
+   255→    }
+   256→  }
+   257→
+   258→  async function saveField(
+   259→    fieldId: string,
+   260→    draft: {
+   261→      label: string;
+   262→      description: string | null;
+   263→      placeholder: string | null;
+   264→      help_text: string | null;
+   265→      is_required: boolean;
+   266→      width: number;
+   267→      config: Record<string, unknown>;
+   268→    },
+   269→  ): Promise<boolean> {
+   270→    setSavingFieldId(fieldId);
+   271→    const { error } = await supabaseBrowser
+   272→      .from("form_fields")
+   273→      .update({
+   274→        label: draft.label,
+   275→        description: draft.description,
+   276→        placeholder: draft.placeholder,
+   277→        help_text: draft.help_text,
+   278→        is_required: draft.is_required,
+   279→        width: draft.width,
+   280→        config: draft.config,
+   281→      })
+   282→      .eq("id", fieldId);
+   283→    setSavingFieldId(null);
+   284→    if (error) {
+   285→      toast.error("Could not save field.", { description: error.message });
+   286→      return false;
+   287→    }
+   288→    setFields((prev) => prev.map((f) => (f.id === fieldId ? { ...f, ...draft } : f)));
+   289→    toast.success("Field saved.");
+   290→    setEditingFieldId(null);
+   291→    return true;
+   292→  }
+   293→
+   294→  async function deleteField(field: FormField) {
+   295→    if (
+   296→      !confirm(
+   297→        `Delete field "${field.label}"? Answers already collected for this field will also be removed. This cannot be undone.`,
+   298→      )
+   299→    ) {
+   300→      return;
+   301→    }
+   302→    setDeletingFieldId(field.id);
+   303→    const { error } = await supabaseBrowser.from("form_fields").delete().eq("id", field.id);
+   304→    setDeletingFieldId(null);
+   305→    if (error) {
+   306→      toast.error("Could not delete field.", { description: error.message });
+   307→      return;
+   308→    }
+   309→    setFields((prev) => prev.filter((f) => f.id !== field.id));
+   310→    if (editingFieldId === field.id) setEditingFieldId(null);
+   311→    toast.success("Field deleted.");
+   312→  }
+   313→
+   314→  /**
+   315→   * Persist a new field order. Only rows whose sort_order actually changed
+   316→   * are written (typically 1–3 rows per move) — one batch of updates AFTER
+   317→   * the drop, never during dragging.
+   318→   */
+   319→  async function persistOrder(nextFields: FormField[], previousFields: FormField[]) {
+   320→    setReorderError(null);
+   321→    setFields(nextFields);
+   322→
+   323→    const updates: { id: string; sort_order: number }[] = [];
+   324→    nextFields.forEach((f, idx) => {
+   325→      if (previousFields.find((p) => p.id === f.id)?.sort_order !== idx) {
+   326→        updates.push({ id: f.id, sort_order: idx });
+   327→      }
+   328→    });
+   329→    if (updates.length === 0) return;
+   330→
+   331→    try {
+   332→      for (const u of updates) {
+   333→        const { error } = await supabaseBrowser
+   334→          .from("form_fields")
+   335→          .update({ sort_order: u.sort_order })
+   336→          .eq("id", u.id);
+   337→        if (error) throw error;
+   338→      }
+   339→      toast.success("Field order saved.");
+   340→    } catch (e) {
+   341→      // Persistence failed — restore the last database-confirmed order.
+   342→      setFields(previousFields);
+   343→      setReorderError(
+   344→        "Could not save the new order. Reverted to the last saved order.",
+   345→      );
+   346→      toast.error("Could not save field order.", {
+   347→        description: e instanceof Error ? e.message : "Please try again.",
+   348→      });
+   349→    }
+   350→  }
+   351→
+   352→  /* ---------------- Drag and drop ---------------- */
+   353→
+   354→  const sensors = useSensors(
+   355→    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+   356→    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } }),
+   357→  );
+   358→
+   359→  function handleDragEnd(event: DragEndEvent) {
+   360→    const { active, over } = event;
+   361→    if (!over || active.id === over.id) return;
+   362→    const oldIndex = fields.findIndex((f) => f.id === active.id);
+   363→    const newIndex = fields.findIndex((f) => f.id === over.id);
+   364→    if (oldIndex === -1 || newIndex === -1) return;
+   365→    const next = arrayMove(fields, oldIndex, newIndex);
+   366→    void persistOrder(next, fields);
+   367→  }
+   368→
+   369→  function moveField(fieldId: string, direction: -1 | 1) {
+   370→    const index = fields.findIndex((f) => f.id === fieldId);
+   371→    const target = index + direction;
+   372→    if (index === -1 || target < 0 || target >= fields.length) return;
+   373→    const next = arrayMove(fields, index, target);
+   374→    void persistOrder(next, fields);
+   375→  }
+   376→
+   377→  /* ---------------- Render ---------------- */
+   378→
+   379→  if (loading) return <LoadingState title="Loading form…" />;
+   380→  if (loadError) return <ErrorState title="Couldn't load form" description={loadError} />;
+   381→  if (!form) {
+   382→    return (
+   383→      <EmptyState
+   384→        title="Form not found"
+   385→        description="This form may have been deleted, or you don't have access."
+   386→        icon={<FileText className="h-7 w-7" />}
+   387→        action={{ label: "Back to forms", href: "/dashboard/forms/" }}
+   388→      />
+   389→    );
+   390→  }
+   391→
+   392→  const statusColor =
+   393→    form.status === "published"
+   394→      ? "var(--memphis-mint)"
+   395→      : form.status === "paused"
+   396→        ? "var(--memphis-sun)"
+   397→        : form.status === "archived"
+   398→          ? "var(--muted-foreground)"
+   399→          : "var(--memphis-coral)";
+   400→
+   401→  return (
+   402→    <div className="space-y-6">
+   403→      {/* Back link */}
+   404→      <div>
+   405→        <Link
+   406→          href="/dashboard/forms/"
+   407→          className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
+   408→        >
+   409→          <ArrowLeft className="h-3.5 w-3.5" />
+   410→          Back to forms
+   411→        </Link>
+   412→      </div>
+   413→
+   414→      {/* Form header */}
+   415→      <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
+   416→        <GeometricCircle color="coral" size={32} className="-top-3 -right-3 opacity-80" />
+   417→        <div className="relative flex flex-wrap items-start justify-between gap-3">
+   418→          <div className="flex items-center gap-3">
+   419→            <span
+   420→              className="inline-block h-3 w-3 rounded-full"
+   421→              style={{ backgroundColor: statusColor }}
+   422→              aria-label={form.status}
+   423→            />
+   424→            <div>
+   425→              <h1 className="font-display text-2xl font-bold tracking-tight sm:text-3xl">
+   426→                {form.name}
+   427→              </h1>
+   428→              <p className="text-xs text-muted-foreground">
+   429→                Created {new Date(form.created_at).toLocaleDateString()} · Status:{" "}
+   430→                <span className="capitalize">{form.status}</span> ·{" "}
+   431→                {fields.length} field{fields.length === 1 ? "" : "s"}
+   432→              </p>
+   433→            </div>
+   434→          </div>
+   435→          <Button
+   436→            variant="outline"
+   437→            size="sm"
+   438→            onClick={deleteForm}
+   439→            disabled={deleting}
+   440→            className="border-destructive/30 text-destructive hover:bg-destructive/10"
+   441→          >
+   442→            <Trash2 className="h-3.5 w-3.5" />
+   443→            {deleting ? "Deleting…" : "Delete form"}
+   444→          </Button>
+   445→        </div>
+   446→      </div>
+   447→
+   448→      {/* Edit form details */}
+   449→      <section className="rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
+   450→        <h2 className="font-display text-lg font-bold">Form details</h2>
+   451→        <p className="mb-4 text-xs text-muted-foreground">
+   452→          Edit the name and description. Saved directly to the database.
+   453→        </p>
+   454→        <div className="space-y-4">
+   455→          <div className="space-y-2">
+   456→            <Label htmlFor="name">Name</Label>
+   457→            <Input
+   458→              id="name"
+   459→              value={name}
+   460→              onChange={(e) => setName(e.target.value)}
+   461→              disabled={savingForm}
+   462→              className="h-11"
+   463→            />
+   464→          </div>
+   465→          <div className="space-y-2">
+   466→            <Label htmlFor="description">Description</Label>
+   467→            <Textarea
+   468→              id="description"
+   469→              value={description}
+   470→              onChange={(e) => setDescription(e.target.value)}
+   471→              rows={3}
+   472→              disabled={savingForm}
+   473→              placeholder="What is this form for?"
+   474→            />
+   475→          </div>
+   476→        </div>
+   477→        <div className="mt-4 flex justify-end">
+   478→          <Button onClick={saveForm} variant="memphis-coral" disabled={savingForm}>
+   479→            {savingForm ? "Saving…" : "Save changes"}
+   480→          </Button>
+   481→        </div>
+   482→      </section>
+   483→
+   484→      {/* Builder */}
+   485→      <section className="rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
+   486→        <div className="mb-4">
+   487→          <h2 className="font-display text-lg font-bold">Fields</h2>
+   488→          <p className="text-xs text-muted-foreground">
+   489→            Add, edit, reorder and delete fields. Every change is saved to
+   490→            Supabase — drag to reorder, or use the arrow buttons.
+   491→          </p>
+   492→        </div>
+   493→
+   494→        {reorderError && (
+   495→          <p role="alert" className="mb-3 rounded-lg bg-destructive/10 p-2.5 text-xs font-medium text-destructive">
+   496→            {reorderError}
+   497→          </p>
+   498→        )}
+   499→
+   500→        {fields.length === 0 ? (
+   501→          <EmptyState
+   502→            title="No fields yet"
+   503→            description="Add your first field below. Fields are stored as normalized rows — add, edit, reorder and delete are all real database operations."
+   504→            icon={<FileText className="h-6 w-6" />}
+   505→          />
+   506→        ) : (
+   507→          <DndContext
+   508→            sensors={sensors}
+   509→            collisionDetection={closestCenter}
+   510→            onDragEnd={handleDragEnd}
+   511→          >
+   512→            <SortableContext items={fieldIds} strategy={verticalListSortingStrategy}>
+   513→              <ul className="space-y-2">
+   514→                {fields.map((field, index) => (
+   515→                  <SortableFieldRow
+   516→                    key={field.id}
+   517→                    field={field}
+   518→                    index={index}
+   519→                    total={fields.length}
+   520→                    editing={editingFieldId === field.id}
+   521→                    saving={savingFieldId === field.id}
+   522→                    deleting={deletingFieldId === field.id}
+   523→                    disabled={editingFieldId !== null || deletingFieldId !== null}
+   524→                    onEdit={() =>
+   525→                      setEditingFieldId(editingFieldId === field.id ? null : field.id)
+   526→                    }
+   527→                    onSave={(draft) => saveField(field.id, draft)}
+   528→                    onCancel={() => setEditingFieldId(null)}
+   529→                    onDelete={() => deleteField(field)}
+   530→                    onMove={(dir) => moveField(field.id, dir)}
+   531→                  />
+   532→                ))}
+   533→              </ul>
+   534→            </SortableContext>
+   535→          </DndContext>
+   536→        )}
+   537→
+   538→        {/* Add field palette */}
+   539→        <div className="mt-6 space-y-3 border-t border-foreground/10 pt-5">
+   540→          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+   541→            Add a field
+   542→          </p>
+   543→          {(
+   544→            [
+   545→              ["Basic", FIELD_TYPES_BY_GROUP.basic],
+   546→              ["Choice", FIELD_TYPES_BY_GROUP.choice],
+   547→              ["Advanced", FIELD_TYPES_BY_GROUP.advanced],
+   548→            ] as const
+   549→          ).map(([groupName, group]) => (
+   550→            <div key={groupName}>
+   551→              <p className="mb-1.5 text-[11px] font-medium text-muted-foreground/80">
+   552→                {groupName}
+   553→              </p>
+   554→              <div className="flex flex-wrap gap-2">
+   555→                {group.map((t) => (
+   556→                  <button
+   557→                    key={t.value}
+   558→                    type="button"
+   559→                    onClick={() => addField(t.value)}
+   560→                    disabled={addingField !== null || editingFieldId !== null}
+   561→                    className="inline-flex items-center gap-1.5 rounded-md border border-foreground/15 bg-background px-2.5 py-1.5 text-xs font-medium transition-colors hover:border-foreground/30 hover:bg-accent/10 disabled:opacity-50"
+   562→                    aria-label={`Add ${t.label} field`}
+   563→                  >
+   564→                    <span className="font-bold text-[color:var(--memphis-coral)]">
+   565→                      {t.icon}
+   566→                    </span>
+   567→                    {t.label}
+   568→                    {addingField === t.value && (
+   569→                      <span className="text-muted-foreground">…</span>
+   570→                    )}
+   571→                  </button>
+   572→                ))}
+   573→              </div>
+   574→            </div>
+   575→          ))}
+   576→        </div>
+   577→
+   578→        <div className="mt-4 rounded-lg border border-dashed border-foreground/15 bg-background/50 p-3 text-xs text-muted-foreground">
+   579→          <GeometricTriangle color="violet" size={12} className="relative -top-2 opacity-50" />
+   580→          <p>
+   581→            <strong className="text-foreground">Note:</strong> publishing with
+   582→            immutable version snapshots and the public share link arrive in a
+   583→            later phase. The structure you build here is the source of truth
+   584→            the future AI builder will use too.
+   585→          </p>
+   586→        </div>
+   587→      </section>
+   588→    </div>
+   589→  );
+   590→}
+   591→
+   592→/* ------------------------------------------------------------------ */
+   593→/* SortableFieldRow                                                    */
+   594→/* ------------------------------------------------------------------ */
+   595→
+   596→function SortableFieldRow({
+   597→  field,
+   598→  index,
+   599→  total,
+   600→  editing,
+   601→  saving,
+   602→  deleting,
+   603→  disabled,
+   604→  onEdit,
+   605→  onSave,
+   606→  onCancel,
+   607→  onDelete,
+   608→  onMove,
+   609→}: {
+   610→  field: FormField;
+   611→  index: number;
+   612→  total: number;
+   613→  editing: boolean;
+   614→  saving: boolean;
+   615→  deleting: boolean;
+   616→  disabled: boolean;
+   617→  onEdit: () => void;
+   618→  onSave: (draft: {
+   619→    label: string;
+   620→    description: string | null;
+   621→    placeholder: string | null;
+   622→    help_text: string | null;
+   623→    is_required: boolean;
+   624→    width: number;
+   625→    config: Record<string, unknown>;
+   626→  }) => Promise<boolean>;
+   627→  onCancel: () => void;
+   628→  onDelete: () => void;
+   629→  onMove: (direction: -1 | 1) => void;
+   630→}) {
+   631→  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+   632→    useSortable({ id: field.id });
+   633→
+   634→  const style = {
+   635→    transform: CSS.Transform.toString(transform),
+   636→    transition,
+   637→  };
+   638→
+   639→  return (
+   640→    <li
+   641→      ref={setNodeRef}
+   642→      style={style}
+   643→      className={cn(
+   644→        "rounded-xl border border-foreground/10 bg-background",
+   645→        isDragging && "z-10 shadow-lg",
+   646→      )}
+   647→    >
+   648→      <div className="flex flex-wrap items-center gap-2 p-3 sm:flex-nowrap">
+   649→        {/* Drag handle */}
+   650→        <button
+   651→          type="button"
+   652→          className="flex h-9 w-6 shrink-0 cursor-grab touch-none items-center justify-center rounded text-muted-foreground/60 hover:text-foreground disabled:opacity-40"
+   653→          disabled={disabled}
+   654→          {...attributes}
+   655→          {...listeners}
+   656→          aria-label={`Reorder ${field.label} (drag or use arrow buttons)`}
+   657→        >
+   658→          <GripVertical className="h-4 w-4" />
+   659→        </button>
+   660→
+   661→        {/* Index + label + key */}
+   662→        <span className="w-6 shrink-0 font-display text-xs text-muted-foreground">
+   663→          {index + 1}
+   664→        </span>
+   665→        <div className="min-w-0 flex-1">
+   666→          <p className="truncate text-sm font-semibold text-foreground">
+   667→            {field.label}
+   668→            {field.is_required && (
+   669→              <span
+   670→                className="ml-1.5 inline-block h-2 w-2 rounded-full bg-[color:var(--memphis-coral)] align-middle"
+   671→                aria-label="Required"
+   672→              />
+   673→            )}
+   674→          </p>
+   675→          <p className="truncate font-mono text-[11px] text-muted-foreground">
+   676→            {field.field_key}
+   677→          </p>
+   678→        </div>
+   679→
+   680→        {/* Type badge */}
+   681→        <span className="shrink-0 rounded-md bg-muted px-2 py-0.5 text-[11px] font-medium text-foreground/80">
+   682→          {fieldLabel(field.field_type)}
+   683→        </span>
+   684→
+   685→        {/* Width badge */}
+   686→        <span className="hidden shrink-0 text-[11px] text-muted-foreground sm:inline">
+   687→          w:{field.width}
+   688→        </span>
+   689→
+   690→        {/* Move up/down — always available (mobile + keyboard friendly) */}
+   691→        <div className="flex shrink-0 items-center gap-0.5">
+   692→          <Button
+   693→            variant="ghost"
+   694→            size="icon-sm"
+   695→            onClick={() => onMove(-1)}
+   696→            disabled={index === 0 || disabled}
+   697→            aria-label={`Move ${field.label} up`}
+   698→          >
+   699→            <ChevronUp className="h-4 w-4" />
+   700→          </Button>
+   701→          <Button
+   702→            variant="ghost"
+   703→            size="icon-sm"
+   704→            onClick={() => onMove(1)}
+   705→            disabled={index === total - 1 || disabled}
+   706→            aria-label={`Move ${field.label} down`}
+   707→          >
+   708→            <ChevronDown className="h-4 w-4" />
+   709→          </Button>
+   710→        </div>
+   711→
+   712→        {/* Edit toggle */}
+   713→        <Button
+   714→          variant="ghost"
+   715→          size="icon-sm"
+   716→          onClick={onEdit}
+   717→          disabled={deleting || (disabled && !editing)}
+   718→          aria-label={editing ? `Close editor for ${field.label}` : `Edit ${field.label}`}
+   719→          aria-expanded={editing}
+   720→        >
+   721→          {editing ? <ChevronIcon className="h-4 w-4" /> : <Pencil className="h-4 w-4" />}
+   722→        </Button>
+   723→
+   724→        {/* Delete */}
+   725→        <Button
+   726→          variant="ghost"
+   727→          size="icon-sm"
+   728→          onClick={onDelete}
+   729→          disabled={deleting || disabled}
+   730→          aria-label={`Delete ${field.label}`}
+   731→          className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+   732→        >
+   733→          {deleting ? "…" : <Trash2 className="h-4 w-4" />}
+   734→        </Button>
+   735→      </div>
+   736→
+   737→      {/* Expanded editor */}
+   738→      {editing && (
+   739→        <div className="px-3 pb-3">
+   740→          <FieldEditor
+   741→            field={field}
+   742→            saving={saving}
+   743→            onSave={onSave}
+   744→            onCancel={onCancel}
+   745→          />
+   746→        </div>
+   747→      )}
+   748→    </li>
+   749→  );
+   750→}
+   751→

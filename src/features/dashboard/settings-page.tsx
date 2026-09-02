@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { toast } from "sonner";
 import { useAuth } from "@/features/auth/auth-provider";
-import { useWorkspace } from "@/features/dashboard/use-workspace";
+import { useWorkspaceCtx } from "@/features/workspace/workspace-context";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -34,7 +34,7 @@ type Workspace = Database["public"]["Tables"]["workspaces"]["Row"];
  */
 export function SettingsPage() {
   const { user, profile, refreshProfile } = useAuth();
-  const { currentWorkspace, reload: reloadWorkspace } = useWorkspace();
+  const { currentWorkspace, reload: reloadWorkspace } = useWorkspaceCtx();
 
   const handleSaveProfile = async (displayName: string): Promise<boolean> => {
     if (!user) return false;

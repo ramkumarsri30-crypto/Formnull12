@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { useAuth } from "@/features/auth/auth-provider";
-import { useWorkspace } from "@/features/dashboard/use-workspace";
-import { useForms } from "@/features/forms/use-forms";
+import { useWorkspaceCtx } from "@/features/workspace/workspace-context";
 import {
   EmptyState,
   LoadingState,
@@ -17,30 +17,120 @@ import {
   GeometricZigZag,
 } from "@/components/memphis/memphis-decorations";
 import { FileText, Inbox, Plus, ArrowRight } from "lucide-react";
+import { supabaseBrowser } from "@/lib/supabase/client";
+import type { Database } from "@/lib/supabase/types";
+
+type RecentForm = Pick<
+  Database["public"]["Tables"]["forms"]["Row"],
+  "id" | "name" | "description" | "status" | "created_at"
+>;
 
 /**
- * Dashboard overview.
+ * Dashboard overview — ALL data comes from real Supabase queries.
  *
- * Shows:
- *   - Welcome banner with workspace name
- *   - Stat cards (forms count, submissions count)
- *   - Recent forms list (or empty state if no forms)
+ *   - Forms count:      head COUNT query (no rows transferred)
+ *   - Submissions count: head COUNT query on the workspace's submissions
+ *   - Workspace plan:   active workspace row (RLS-authorized)
+ *   - Member since:     membership.joined_at for the ACTIVE workspace
+ *   - Recent forms:     limited query (6 rows, selected columns only)
  *
- * All data is loaded from Supabase via RLS-protected queries. If
- * migrations haven't been applied yet, the UI shows appropriate empty
- * states — no mock data, no fake users, no fake forms.
+ * When there is no data, proper empty states are shown — never mock
+ * numbers.
  */
 export function DashboardOverview() {
   const { user, profile } = useAuth();
-  const { currentWorkspace, currentWorkspaceId, loading: wsLoading } = useWorkspace();
-  const { forms, loading: formsLoading } = useForms(currentWorkspaceId);
+  const {
+    currentWorkspace,
+    currentWorkspaceId,
+    memberships,
+    loading: wsLoading,
+    error: wsError,
+    switching,
+  } = useWorkspaceCtx();
 
-  const loading = wsLoading || formsLoading;
-  const formsCount = forms.length;
-  const submissionsCount = forms.reduce((sum, f) => {
-    const n = (f.metadata as { submission_count?: number })?.submission_count ?? 0;
-    return sum + n;
-  }, 0);
+  const [formsCount, setFormsCount] = useState<number | null>(null);
+  const [submissionsCount, setSubmissionsCount] = useState<number | null>(null);
+  const [recentForms, setRecentForms] = useState<RecentForm[] | null>(null);
+  const [statsError, setStatsError] = useState<string | null>(null);
+
+  const memberSince = memberships.find(
+    (m) => m.workspace_id === currentWorkspaceId,
+  )?.joined_at;
+
+  // Real stats — re-run whenever the active workspace changes.
+  useEffect(() => {
+    const wsId = currentWorkspaceId;
+    let mounted = true;
+
+    async function loadStats() {
+      if (!wsId) {
+        setFormsCount(null);
+        setSubmissionsCount(null);
+        setRecentForms(null);
+        return;
+      }
+      await run(wsId);
+    }
+
+    async function run(wsId: string) {
+      setStatsError(null);
+      // Three independent, bounded queries — run in parallel.
+      // count/head uses PostgREST's exact count without fetching rows.
+      const [formsRes, subsRes, recentRes] = await Promise.all([
+        supabaseBrowser
+          .from("forms")
+          .select("id", { count: "exact", head: true })
+          .eq("workspace_id", wsId),
+        supabaseBrowser
+          .from("submissions")
+          .select("id", { count: "exact", head: true })
+          .eq("workspace_id", wsId),
+        supabaseBrowser
+          .from("forms")
+          .select("id, name, description, status, created_at")
+          .eq("workspace_id", wsId)
+          .order("created_at", { ascending: false })
+          .limit(6),
+      ]);
+
+      if (!mounted) return;
+
+      const firstError = formsRes.error ?? subsRes.error ?? recentRes.error;
+      if (firstError) {
+        // Missing tables (migrations not applied) → show empty, not fake data.
+        if (
+          firstError.code === "42P01" ||
+          firstError.code === "PGRST205"
+        ) {
+          setFormsCount(0);
+          setSubmissionsCount(0);
+          setRecentForms([]);
+        } else {
+          setStatsError(firstError.message);
+        }
+        return;
+      }
+      setFormsCount(formsRes.count ?? 0);
+      setSubmissionsCount(subsRes.count ?? 0);
+      setRecentForms((recentRes.data as RecentForm[]) ?? []);
+    }
+
+    void loadStats();
+    return () => {
+      mounted = false;
+    };
+  }, [currentWorkspaceId]);
+
+  const loading = wsLoading || formsCount === null || recentForms === null || switching;
+
+  if (wsError) {
+    return (
+      <ErrorState
+        title="Couldn't load workspace"
+        description={wsError}
+      />
+    );
+  }
 
   return (
     <div className="space-y-6 sm:space-y-8">
@@ -62,7 +152,7 @@ export function DashboardOverview() {
           <p className="mt-2 text-sm text-background/80 sm:text-base">
             {currentWorkspace
               ? `Working in ${currentWorkspace.name}.`
-              : "Set up your workspace to start building forms."}
+              : "Set up a workspace to start building forms."}
           </p>
           <div className="mt-5">
             <Button asChild variant="memphis-coral" size="sm">
@@ -75,33 +165,45 @@ export function DashboardOverview() {
         </div>
       </div>
 
-      {/* Stats */}
+      {/* Stats — all real values from Supabase */}
       <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-4">
         <StatCard
           label="Forms"
-          value={loading ? "—" : String(formsCount)}
+          value={loading ? "—" : String(formsCount ?? 0)}
           icon={<FileText className="h-4 w-4" />}
           color="coral"
         />
         <StatCard
           label="Submissions"
-          value={loading ? "—" : String(submissionsCount)}
+          value={loading ? "—" : String(submissionsCount ?? 0)}
           icon={<Inbox className="h-4 w-4" />}
           color="mint"
         />
         <StatCard
           label="Workspace plan"
-          value={currentWorkspace?.plan ?? "free"}
+          value={currentWorkspace?.plan ?? (loading ? "—" : "—")}
           icon={<span className="text-xs font-bold">★</span>}
           color="violet"
         />
         <StatCard
           label="Member since"
-          value={profile?.created_at ? new Date(profile.created_at).toLocaleDateString() : "—"}
+          value={
+            memberSince
+              ? new Date(memberSince).toLocaleDateString()
+              : loading
+                ? "—"
+                : "—"
+          }
           icon={<span className="text-xs font-bold">●</span>}
           color="sun"
         />
       </div>
+
+      {statsError && (
+        <p role="alert" className="rounded-lg bg-destructive/10 p-3 text-sm font-medium text-destructive">
+          Some stats failed to load: {statsError}
+        </p>
+      )}
 
       {/* Recent forms */}
       <section>
@@ -109,9 +211,9 @@ export function DashboardOverview() {
           <h2 className="font-display text-lg font-bold tracking-tight sm:text-xl">
             Recent forms
           </h2>
-          {formsCount > 0 && (
+          {(formsCount ?? 0) > 0 && (
             <Button asChild variant="ghost" size="sm">
-              <Link href="/dashboard/forms">
+              <Link href="/dashboard/forms/">
                 View all
                 <ArrowRight className="h-3.5 w-3.5" />
               </Link>
@@ -121,7 +223,7 @@ export function DashboardOverview() {
 
         {loading ? (
           <LoadingState title="Loading your forms…" />
-        ) : formsCount === 0 ? (
+        ) : (formsCount ?? 0) === 0 ? (
           <EmptyState
             title="No forms yet"
             description="Create your first form to start collecting submissions. It takes less than a minute."
@@ -133,7 +235,7 @@ export function DashboardOverview() {
           />
         ) : (
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {forms.slice(0, 6).map((f) => (
+            {(recentForms ?? []).map((f) => (
               <FormCard key={f.id} form={f} />
             ))}
           </div>
@@ -178,10 +280,7 @@ function StatCard({
 /* ------------------------------------------------------------------ */
 /* FormCard                                                            */
 /* ------------------------------------------------------------------ */
-import type { Database } from "@/lib/supabase/types";
-type FormRow = Database["public"]["Tables"]["forms"]["Row"];
-
-function FormCard({ form }: { form: FormRow }) {
+function FormCard({ form }: { form: RecentForm }) {
   const statusColor =
     form.status === "published"
       ? "var(--memphis-mint)"

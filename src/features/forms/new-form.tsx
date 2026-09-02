@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { useWorkspace } from "@/features/dashboard/use-workspace";
+import { useWorkspaceCtx } from "@/features/workspace/workspace-context";
 import { useAuth } from "@/features/auth/auth-provider";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -60,7 +60,7 @@ function slugify(s: string): string {
 export function NewFormPage() {
   const router = useRouter();
   const { user } = useAuth();
-  const { currentWorkspaceId, loading: wsLoading } = useWorkspace();
+  const { currentWorkspaceId, loading: wsLoading, currentWorkspace } = useWorkspaceCtx();
 
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -71,9 +71,19 @@ export function NewFormPage() {
   const [saving, setSaving] = useState(false);
   const [errors, setErrors] = useState<{ name?: string }>({});
 
+  // Unique field_key generation against the current draft fields.
+  function uniqueKey(label: string): string {
+    const base = slugify(label);
+    const keys = fields.map((f) => f.field_key);
+    if (!keys.includes(base)) return base;
+    let i = 2;
+    while (keys.includes(`${base}_${i}`)) i += 1;
+    return `${base}_${i}`;
+  }
+
   function addField(type: FieldType) {
     const label = FIELD_TYPES.find((f) => f.value === type)?.label ?? "Field";
-    const field_key = slugify(label + "_" + (fields.length + 1));
+    const field_key = uniqueKey(label);
     setFields([...fields, { field_key, field_type: type, label, is_required: false }]);
   }
 
@@ -164,6 +174,12 @@ export function NewFormPage() {
       <Header />
 
       <form onSubmit={onSubmit} className="space-y-6">
+        {/* Workspace context banner — real, from the active workspace */}
+        <div className="flex items-center gap-2 rounded-lg border border-foreground/10 bg-background px-3 py-2 text-xs text-muted-foreground">
+          <span className="font-semibold text-foreground">Workspace:</span>
+          <span className="truncate">{currentWorkspace?.name ?? "—"}</span>
+        </div>
+
         {/* Form details */}
         <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
           <GeometricCircle color="coral" size={32} className="-top-3 -right-3 opacity-80" />

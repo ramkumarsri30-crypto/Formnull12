@@ -1,0 +1,588 @@
+"use client";
+
+/**
+ * FormNull — Field Editor (Phase 2)
+ * =====================================================================
+ * Per-field configuration editor used inside the form builder.
+ *
+ * Edits label, description, placeholder, help text, required, width
+ * (1-12, matching the DB CHECK constraint) and the typed config model
+ * for the field's type (options for selects, min/max/step for numbers,
+ * allowed types for uploads, etc.).
+ *
+ * Saving is EXPLICIT: the Save button performs a real Supabase UPDATE.
+ * While saving, controls are disabled. On failure the editor stays open
+ * with the user's values preserved and a real error is shown.
+ */
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Plus, Trash2, GripVertical } from "lucide-react";
+import type { Database } from "@/lib/supabase/types";
+import { fieldMeta, validateConfig, validateWidth } from "./field-types";
+
+type FormField = Database["public"]["Tables"]["form_fields"]["Row"];
+
+interface Draft {
+  label: string;
+  description: string | null;
+  placeholder: string | null;
+  help_text: string | null;
+  is_required: boolean;
+  width: number;
+  config: Record<string, unknown>;
+}
+
+/** Internal editable state — plain strings, converted to null on save. */
+interface EditableDraft {
+  label: string;
+  description: string;
+  placeholder: string;
+  help_text: string;
+  is_required: boolean;
+  width: number;
+  config: Record<string, unknown>;
+}
+
+export function FieldEditor({
+  field,
+  saving,
+  onSave,
+  onCancel,
+}: {
+  field: FormField;
+  saving: boolean;
+  onSave: (draft: Draft) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const meta = fieldMeta(field.field_type);
+  const kind = meta?.configKind ?? "none";
+
+  const [draft, setDraft] = useState<EditableDraft>({
+    label: field.label,
+    description: field.description ?? "",
+    placeholder: field.placeholder ?? "",
+    help_text: field.help_text ?? "",
+    is_required: field.is_required,
+    width: field.width,
+    config: { ...(field.config ?? {}) },
+  });
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  function patch(p: Partial<EditableDraft>) {
+    setDraft((d) => ({ ...d, ...p }));
+    setValidationError(null);
+  }
+
+  function patchConfig(p: Record<string, unknown>) {
+    setDraft((d) => ({ ...d, config: { ...d.config, ...p } }));
+    setValidationError(null);
+  }
+
+  async function save() {
+    if (!draft.label.trim()) {
+      setValidationError("Label is required.");
+      return;
+    }
+    const widthCheck = validateWidth(draft.width);
+    if (!widthCheck.ok) {
+      setValidationError(widthCheck.message ?? "Invalid width.");
+      return;
+    }
+    const configCheck = validateConfig(kind, field.field_type, draft.config);
+    if (!configCheck.ok) {
+      setValidationError(configCheck.message ?? "Invalid configuration.");
+      return;
+    }
+    await onSave({
+      label: draft.label.trim(),
+      description: draft.description.trim() || null,
+      placeholder: draft.placeholder.trim() || null,
+      help_text: draft.help_text.trim() || null,
+      is_required: draft.is_required,
+      width: draft.width,
+      config: cleanConfig(kind, draft.config),
+    });
+  }
+
+  const showPlaceholder =
+    field.field_type === "short_text" ||
+    field.field_type === "long_text" ||
+    field.field_type === "email" ||
+    field.field_type === "url" ||
+    field.field_type === "phone" ||
+    field.field_type === "number" ||
+    field.field_type === "decimal";
+
+  return (
+    <div className="rounded-xl border-2 border-foreground/15 bg-background p-4 sm:p-5">
+      <div className="grid gap-4 sm:grid-cols-2">
+        {/* Label */}
+        <div className="space-y-2 sm:col-span-2">
+          <Label htmlFor={`label-${field.id}`}>Label</Label>
+          <Input
+            id={`label-${field.id}`}
+            value={draft.label}
+            onChange={(e) => patch({ label: e.target.value })}
+            disabled={saving}
+            className="h-10"
+            placeholder="Question shown to respondents"
+            aria-invalid={!!validationError && !draft.label.trim()}
+          />
+        </div>
+
+        {/* field_key — machine-readable, immutable (used by submission_values) */}
+        <div className="sm:col-span-2">
+          <p className="text-xs text-muted-foreground">
+            <span className="font-mono">{field.field_key}</span>{" "}
+            <span className="opacity-70">
+              · machine key (immutable — links saved answers)
+            </span>
+          </p>
+        </div>
+
+        {/* Description */}
+        <div className="space-y-2 sm:col-span-2">
+          <Label htmlFor={`desc-${field.id}`} className="text-xs">
+            Description (optional)
+          </Label>
+          <Textarea
+            id={`desc-${field.id}`}
+            value={draft.description}
+            onChange={(e) => patch({ description: e.target.value })}
+            disabled={saving}
+            rows={2}
+            placeholder="Extra context under the label"
+          />
+        </div>
+
+        {/* Placeholder */}
+        {showPlaceholder && (
+          <div className="space-y-2">
+            <Label htmlFor={`ph-${field.id}`} className="text-xs">
+              Placeholder (optional)
+            </Label>
+            <Input
+              id={`ph-${field.id}`}
+              value={draft.placeholder}
+              onChange={(e) => patch({ placeholder: e.target.value })}
+              disabled={saving}
+              className="h-10"
+            />
+          </div>
+        )}
+
+        {/* Help text */}
+        <div className="space-y-2">
+          <Label htmlFor={`help-${field.id}`} className="text-xs">
+            Help text (optional)
+          </Label>
+          <Input
+            id={`help-${field.id}`}
+            value={draft.help_text}
+            onChange={(e) => patch({ help_text: e.target.value })}
+            disabled={saving}
+            className="h-10"
+            placeholder="Shown below the input"
+          />
+        </div>
+
+        {/* Width + Required */}
+        <div className="space-y-2">
+          <Label htmlFor={`width-${field.id}`} className="text-xs">
+            Width — grid columns (1–12)
+          </Label>
+          <Select
+            value={String(draft.width)}
+            onValueChange={(v) => patch({ width: Number(v) })}
+            disabled={saving}
+          >
+            <SelectTrigger id={`width-${field.id}`} className="h-10">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {Array.from({ length: 12 }, (_, i) => i + 1).map((w) => (
+                <SelectItem key={w} value={String(w)}>
+                  {w === 12 ? "12 — full width" : w === 6 ? "6 — half" : String(w)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+
+        <div className="flex items-center justify-between rounded-lg border border-foreground/10 p-3">
+          <div>
+            <Label htmlFor={`req-${field.id}`} className="text-xs">
+              Required
+            </Label>
+            <p className="text-[11px] text-muted-foreground">
+              Respondents must fill this in
+            </p>
+          </div>
+          <Switch
+            id={`req-${field.id}`}
+            checked={draft.is_required}
+            onCheckedChange={(v) => patch({ is_required: v })}
+            disabled={saving}
+          />
+        </div>
+
+        {/* Type-specific config */}
+        {kind === "select" && (
+          <SelectOptionsEditor
+            options={(draft.config.options as string[]) ?? []}
+            onChange={(options) => patchConfig({ options })}
+            saving={saving}
+          />
+        )}
+        {kind === "text" && (
+          <TextConfigEditor
+            config={draft.config}
+            showPattern={field.field_type === "short_text"}
+            onChange={patchConfig}
+            saving={saving}
+          />
+        )}
+        {(kind === "number" || kind === "scale") && (
+          <RangeConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+        )}
+        {kind === "rating" && (
+          <RatingConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+        )}
+        {kind === "file" && (
+          <FileConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+        )}
+      </div>
+
+      {/* Validation error */}
+      {validationError && (
+        <p role="alert" className="mt-3 text-xs font-medium text-destructive">
+          {validationError}
+        </p>
+      )}
+
+      {/* Actions */}
+      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:justify-end">
+        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>
+          Cancel
+        </Button>
+        <Button variant="memphis-coral" size="sm" onClick={save} disabled={saving}>
+          {saving ? "Saving…" : "Save field"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Type-specific config editors                                        */
+/* ------------------------------------------------------------------ */
+
+function SelectOptionsEditor({
+  options,
+  onChange,
+  saving,
+}: {
+  options: string[];
+  onChange: (options: string[]) => void;
+  saving: boolean;
+}) {
+  const [newOption, setNewOption] = useState("");
+  return (
+    <div className="space-y-2 sm:col-span-2">
+      <Label className="text-xs">Options</Label>
+      <div className="space-y-2">
+        {options.map((opt, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <GripVertical className="h-3.5 w-3.5 shrink-0 text-muted-foreground/50" aria-hidden />
+            <Input
+              value={opt}
+              onChange={(e) => {
+                const next = [...options];
+                next[i] = e.target.value;
+                onChange(next);
+              }}
+              disabled={saving}
+              className="h-9"
+              aria-label={`Option ${i + 1}`}
+            />
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => onChange(options.filter((_, j) => j !== i))}
+              disabled={saving}
+              aria-label={`Remove option ${opt}`}
+              className="shrink-0 text-muted-foreground hover:text-destructive"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <Input
+            value={newOption}
+            onChange={(e) => setNewOption(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && newOption.trim()) {
+                e.preventDefault();
+                onChange([...options, newOption.trim()]);
+                setNewOption("");
+              }
+            }}
+            disabled={saving}
+            placeholder="New option"
+            className="h-9"
+            aria-label="New option"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              if (newOption.trim()) {
+                onChange([...options, newOption.trim()]);
+                setNewOption("");
+              }
+            }}
+            disabled={saving || !newOption.trim()}
+            className="shrink-0"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add
+          </Button>
+        </div>
+        {options.length === 0 && (
+          <p className="text-xs text-muted-foreground">
+            At least one option is required before saving.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TextConfigEditor({
+  config,
+  showPattern,
+  onChange,
+  saving,
+}: {
+  config: Record<string, unknown>;
+  showPattern: boolean;
+  onChange: (p: Record<string, unknown>) => void;
+  saving: boolean;
+}) {
+  const num = (v: unknown): string => (v == null ? "" : String(v));
+  return (
+    <>
+      <div className="space-y-2">
+        <Label className="text-xs">Min length</Label>
+        <Input
+          type="number"
+          min={0}
+          value={num(config.minLength)}
+          onChange={(e) =>
+            onChange({
+              minLength: e.target.value === "" ? null : Number(e.target.value),
+            })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className="text-xs">Max length</Label>
+        <Input
+          type="number"
+          min={1}
+          value={num(config.maxLength)}
+          onChange={(e) =>
+            onChange({
+              maxLength: e.target.value === "" ? null : Number(e.target.value),
+            })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+      {showPattern && (
+        <div className="space-y-2 sm:col-span-2">
+          <Label className="text-xs">Pattern (regex, optional)</Label>
+          <Input
+            value={typeof config.pattern === "string" ? config.pattern : ""}
+            onChange={(e) => onChange({ pattern: e.target.value || null })}
+            disabled={saving}
+            className="h-10 font-mono text-xs"
+            placeholder="^[A-Z]{3}-\d{4}$"
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+function RangeConfigEditor({
+  config,
+  onChange,
+  saving,
+}: {
+  config: Record<string, unknown>;
+  onChange: (p: Record<string, unknown>) => void;
+  saving: boolean;
+}) {
+  const num = (v: unknown): string => (v == null ? "" : String(v));
+  return (
+    <>
+      <div className="space-y-2">
+        <Label className="text-xs">Min</Label>
+        <Input
+          type="number"
+          value={num(config.min)}
+          onChange={(e) =>
+            onChange({ min: e.target.value === "" ? null : Number(e.target.value) })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className="text-xs">Max</Label>
+        <Input
+          type="number"
+          value={num(config.max)}
+          onChange={(e) =>
+            onChange({ max: e.target.value === "" ? null : Number(e.target.value) })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className="text-xs">Step</Label>
+        <Input
+          type="number"
+          min={0.01}
+          step="any"
+          value={num(config.step)}
+          onChange={(e) =>
+            onChange({ step: e.target.value === "" ? null : Number(e.target.value) })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+    </>
+  );
+}
+
+function RatingConfigEditor({
+  config,
+  onChange,
+  saving,
+}: {
+  config: Record<string, unknown>;
+  onChange: (p: Record<string, unknown>) => void;
+  saving: boolean;
+}) {
+  const max = typeof config.max === "number" ? config.max : 5;
+  return (
+    <div className="space-y-2">
+      <Label className="text-xs">Maximum rating (2–10)</Label>
+      <Input
+        type="number"
+        min={2}
+        max={10}
+        value={max}
+        onChange={(e) => onChange({ max: e.target.value === "" ? null : Number(e.target.value) })}
+        disabled={saving}
+        className="h-10"
+      />
+      <p className="text-[11px] text-muted-foreground">
+        {"★".repeat(Math.min(Math.max(max, 0), 10))}
+      </p>
+    </div>
+  );
+}
+
+function FileConfigEditor({
+  config,
+  onChange,
+  saving,
+}: {
+  config: Record<string, unknown>;
+  onChange: (p: Record<string, unknown>) => void;
+  saving: boolean;
+}) {
+  const typesStr = Array.isArray(config.allowedTypes)
+    ? (config.allowedTypes as string[]).join(", ")
+    : "";
+  return (
+    <>
+      <div className="space-y-2">
+        <Label className="text-xs">Allowed types (comma-separated)</Label>
+        <Input
+          value={typesStr}
+          onChange={(e) =>
+            onChange({
+              allowedTypes: e.target.value
+                ? e.target.value
+                    .split(",")
+                    .map((t) => t.trim())
+                    .filter(Boolean)
+                : null,
+            })
+          }
+          disabled={saving}
+          className="h-10 font-mono text-xs"
+          placeholder="image/png, application/pdf"
+        />
+      </div>
+      <div className="space-y-2">
+        <Label className="text-xs">Max size (MB, ≤ 100)</Label>
+        <Input
+          type="number"
+          min={1}
+          max={100}
+          value={typeof config.maxSizeMb === "number" ? config.maxSizeMb : ""}
+          onChange={(e) =>
+            onChange({
+              maxSizeMb: e.target.value === "" ? null : Number(e.target.value),
+            })
+          }
+          disabled={saving}
+          className="h-10"
+        />
+      </div>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Helpers                                                             */
+/* ------------------------------------------------------------------ */
+
+function cleanConfig(
+  kind: string,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  // Remove null/undefined values and empty strings so we never persist
+  // junk like {"minLength": null}.
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(config)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    if (Array.isArray(v) && v.length === 0 && kind !== "select") continue;
+    out[k] = v;
+  }
+  // Selects must keep their options array even when empty is invalid —
+  // validation already blocks empty option lists.
+  if (kind === "select" && Array.isArray(config.options)) {
+    out.options = (config.options as unknown[]).filter(
+      (o) => typeof o === "string" && (o as string).trim() !== "",
+    );
+  }
+  return out;
+}

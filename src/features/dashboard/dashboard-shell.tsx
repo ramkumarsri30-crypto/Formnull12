@@ -5,7 +5,30 @@ import { usePathname } from "next/navigation";
 import { useState } from "react";
 import { Logo } from "@/components/formnull/logo";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/features/auth/auth-provider";
+import {
+  WorkspaceProvider,
+  useWorkspaceCtx,
+} from "@/features/workspace/workspace-context";
 import {
   LayoutDashboard,
   FileText,
@@ -15,6 +38,8 @@ import {
   X,
   ChevronDown,
   Plus,
+  Check,
+  Building2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -38,18 +63,22 @@ const NAV = [
  *   - Desktop (lg+): persistent left sidebar (260px)
  *   - Tablet/mobile: hidden sidebar, hamburger opens a drawer
  *
- * Workspace selector is shown at the top of the sidebar. For Phase 1,
- * it shows the user's default workspace (or "Personal workspace").
+ * The WorkspaceProvider wraps ALL children so every page shares one
+ * active-workspace state (loaded from and persisted to Supabase).
  */
 export function DashboardShell({ children }: { children: React.ReactNode }) {
+  return (
+    <WorkspaceProvider>
+      <DashboardShellInner>{children}</DashboardShellInner>
+    </WorkspaceProvider>
+  );
+}
+
+function DashboardShellInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { user, profile, loading, signOut } = useAuth();
+  const { signOut } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
-
-  const workspaceName = profile?.display_name
-    ? `${profile.display_name}'s workspace`
-    : "Personal workspace";
 
   async function handleSignOut() {
     await signOut();
@@ -69,8 +98,6 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
       >
         <SidebarContent
           pathname={pathname}
-          workspaceName={workspaceName}
-          userEmail={user?.email ?? ""}
           onSignOut={handleSignOut}
         />
       </aside>
@@ -100,8 +127,6 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
             </div>
             <SidebarContent
               pathname={pathname}
-              workspaceName={workspaceName}
-              userEmail={user?.email ?? ""}
               onSignOut={handleSignOut}
               onNavigate={() => setMobileOpen(false)}
             />
@@ -156,7 +181,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 }
 
 function getPageTitle(pathname: string): string {
-  if (pathname === "/dashboard") return "Overview";
+  if (pathname === "/dashboard" || pathname === "/dashboard/") return "Overview";
   if (pathname.startsWith("/dashboard/forms/new")) return "New form";
   if (pathname.startsWith("/dashboard/forms")) return "Forms";
   if (pathname.startsWith("/dashboard/settings")) return "Settings";
@@ -164,19 +189,40 @@ function getPageTitle(pathname: string): string {
   return "Dashboard";
 }
 
+/* ------------------------------------------------------------------ */
+/* Sidebar content — with the REAL workspace selector                  */
+/* ------------------------------------------------------------------ */
+
 function SidebarContent({
   pathname,
-  workspaceName,
-  userEmail,
   onSignOut,
   onNavigate,
 }: {
   pathname: string;
-  workspaceName: string;
-  userEmail: string;
   onSignOut: () => void;
   onNavigate?: () => void;
 }) {
+  const { user } = useAuth();
+  const {
+    workspaces,
+    currentWorkspace,
+    currentWorkspaceId,
+    currentRole,
+    memberships,
+    loading,
+    setWorkspace,
+    createWorkspace,
+    switching,
+  } = useWorkspaceCtx();
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const userEmail = user?.email ?? "";
+  const workspaceName = currentWorkspace?.name ?? (loading ? "Loading…" : "No workspace");
+
+  function workspaceRole(wsId: string) {
+    return memberships.find((m) => m.workspace_id === wsId)?.role ?? null;
+  }
+
   return (
     <>
       {/* Logo (desktop only — mobile drawer has its own) */}
@@ -184,30 +230,81 @@ function SidebarContent({
         <Logo />
       </div>
 
-      {/* Workspace selector */}
+      {/* Workspace selector — REAL: lists the user's workspaces from
+          Supabase, switches the active workspace, persists the selection. */}
       <div className="px-3 py-3">
-        <button
-          className="group flex w-full items-center gap-3 rounded-lg border-2 border-foreground/10 bg-background p-2.5 text-left transition-colors hover:border-foreground/20"
-          aria-label="Workspace switcher (coming in Phase 2)"
-          title="Workspace switcher (coming in Phase 2)"
-        >
-          <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[color:var(--memphis-coral)] text-white">
-            <span className="font-display text-sm font-bold">
-              {workspaceName.charAt(0).toUpperCase()}
-            </span>
-            <GeometricSquare
-              color="mint"
-              size={8}
-              rotate={12}
-              className="-bottom-1 -right-1 opacity-90"
-            />
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-xs text-muted-foreground">Workspace</p>
-            <p className="truncate text-sm font-semibold">{workspaceName}</p>
-          </div>
-          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
-        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <button
+              className="group flex w-full items-center gap-3 rounded-lg border-2 border-foreground/10 bg-background p-2.5 text-left transition-colors hover:border-foreground/20 disabled:opacity-60"
+              aria-label="Switch workspace"
+              disabled={switching}
+            >
+              <div className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[color:var(--memphis-coral)] text-white">
+                <span className="font-display text-sm font-bold">
+                  {(currentWorkspace?.name ?? "W").charAt(0).toUpperCase()}
+                </span>
+                <GeometricSquare
+                  color="mint"
+                  size={8}
+                  rotate={12}
+                  className="-bottom-1 -right-1 opacity-90"
+                />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-xs text-muted-foreground">
+                  Workspace{currentRole ? ` · ${currentRole}` : ""}
+                </p>
+                <p className="truncate text-sm font-semibold">{workspaceName}</p>
+              </div>
+              <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            align="start"
+            side="right"
+            className="w-60 max-w-[calc(100vw-2rem)]"
+          >
+            <DropdownMenuLabel>Your workspaces</DropdownMenuLabel>
+            {workspaces.map((ws) => (
+              <DropdownMenuItem
+                key={ws.id}
+                onClick={() => void setWorkspace(ws.id)}
+                disabled={switching}
+                className="gap-2"
+                aria-current={ws.id === currentWorkspaceId ? "true" : undefined}
+              >
+                <Check
+                  className={cn(
+                    "h-4 w-4 shrink-0",
+                    ws.id === currentWorkspaceId ? "opacity-100" : "opacity-0",
+                  )}
+                  aria-hidden
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate font-medium">{ws.name}</span>
+                  <span className="block text-xs capitalize text-muted-foreground">
+                    {workspaceRole(ws.id)} · {ws.plan}
+                  </span>
+                </span>
+              </DropdownMenuItem>
+            ))}
+            {workspaces.length === 0 && !loading && (
+              <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                No workspaces yet — create one below.
+              </p>
+            )}
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => setCreateOpen(true)}
+              disabled={switching}
+              className="gap-2"
+            >
+              <Building2 className="h-4 w-4" />
+              Create workspace
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
 
       {/* Nav */}
@@ -216,6 +313,7 @@ function SidebarContent({
           const Icon = item.icon;
           const active =
             pathname === item.href ||
+            pathname === `${item.href}/` ||
             (item.href !== "/dashboard" && pathname.startsWith(item.href));
           return (
             <Link
@@ -267,6 +365,99 @@ function SidebarContent({
           Sign out
         </Button>
       </div>
+
+      {/* Create workspace dialog */}
+      <CreateWorkspaceDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        onCreate={createWorkspace}
+      />
     </>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Create workspace dialog                                             */
+/* ------------------------------------------------------------------ */
+
+function CreateWorkspaceDialog({
+  open,
+  onOpenChange,
+  onCreate,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onCreate: (name: string, description?: string) => Promise<unknown>;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  async function handleCreate() {
+    if (!name.trim()) return;
+    setCreating(true);
+    const ws = await onCreate(name, description);
+    setCreating(false);
+    if (ws) {
+      setName("");
+      setDescription("");
+      onOpenChange(false);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(o) => !creating && onOpenChange(o)}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Create a workspace</DialogTitle>
+          <DialogDescription>
+            A new workspace gets its own forms and submissions. You will be its
+            owner.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-4 py-2">
+          <div className="space-y-2">
+            <Label htmlFor="ws-create-name">Workspace name</Label>
+            <Input
+              id="ws-create-name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Acme Inc."
+              disabled={creating}
+              aria-required="true"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="ws-create-desc">Description (optional)</Label>
+            <Textarea
+              id="ws-create-desc"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              rows={2}
+              disabled={creating}
+              placeholder="What is this workspace for?"
+            />
+          </div>
+        </div>
+        <DialogFooter className="flex-col gap-2 sm:flex-row">
+          <Button
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={creating}
+            className="w-full sm:w-auto"
+          >
+            Cancel
+          </Button>
+          <Button
+            variant="memphis-coral"
+            onClick={handleCreate}
+            disabled={creating || !name.trim()}
+            className="w-full sm:w-auto"
+          >
+            {creating ? "Creating…" : "Create workspace"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

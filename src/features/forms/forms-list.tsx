@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useWorkspace } from "@/features/dashboard/use-workspace";
+import { useWorkspaceCtx } from "@/features/workspace/workspace-context";
 import { useForms } from "@/features/forms/use-forms";
 import {
   EmptyState,
@@ -15,7 +15,7 @@ import type { Database } from "@/lib/supabase/types";
 type FormRow = Database["public"]["Tables"]["forms"]["Row"];
 
 export function FormsList() {
-  const { currentWorkspaceId, loading: wsLoading, error: wsError } = useWorkspace();
+  const { currentWorkspaceId, loading: wsLoading, error: wsError, currentWorkspace } = useWorkspaceCtx();
   const { forms, loading: formsLoading, error: formsError, reload } = useForms(currentWorkspaceId);
 
   const loading = wsLoading || formsLoading;
@@ -37,7 +37,7 @@ export function FormsList() {
   if (forms.length === 0) {
     return (
       <div className="space-y-4">
-        <Header />
+        <Header workspaceName={currentWorkspace?.name} />
         <EmptyState
           title="No forms yet"
           description="Create your first form to start collecting submissions. Forms are workspace-scoped and use normalized storage for unlimited scale."
@@ -53,7 +53,7 @@ export function FormsList() {
 
   return (
     <div className="space-y-6">
-      <Header />
+      <Header workspaceName={currentWorkspace?.name} />
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {forms.map((f) => (
           <FormRowCard key={f.id} form={f} />
@@ -63,7 +63,7 @@ export function FormsList() {
   );
 }
 
-function Header() {
+function Header({ workspaceName }: { workspaceName?: string }) {
   return (
     <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
       <div>
@@ -71,7 +71,9 @@ function Header() {
           Forms
         </h1>
         <p className="text-sm text-muted-foreground">
-          Manage all forms in this workspace.
+          {workspaceName
+            ? `All forms in ${workspaceName}.`
+            : "Manage all forms in this workspace."}
         </p>
       </div>
       <Button asChild variant="memphis-coral" size="sm">

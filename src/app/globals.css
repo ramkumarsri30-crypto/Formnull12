@@ -1,0 +1,347 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+/* =====================================================================
+   FormNull — Memphis / Playful Geometric Design System
+   =====================================================================
+   The Memphis design language combines bold geometric shapes, playful
+   color blocking, and modern premium SaaS UI. These tokens establish
+   the foundation: every component derives from these variables.
+   ===================================================================== */
+
+@theme inline {
+  /* Color primitives (mapped to CSS vars) */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-focus: var(--focus);
+
+  /* Memphis palette — secondary accent colors used by decorations */
+  --color-memphis-coral: var(--memphis-coral);
+  --color-memphis-mint: var(--memphis-mint);
+  --color-memphis-sun: var(--memphis-sun);
+  --color-memphis-violet: var(--memphis-violet);
+  --color-memphis-sky: var(--memphis-sky);
+  --color-memphis-pink: var(--memphis-pink);
+  --color-memphis-lemon: var(--memphis-lemon);
+  --color-memphis-ink: var(--memphis-ink);
+  --color-surface: var(--surface);
+  --color-surface-elevated: var(--surface-elevated);
+
+  /* Fonts */
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-display);
+
+  /* Radius scale */
+  --radius-xs: calc(var(--radius) - 8px);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+  --radius-3xl: calc(var(--radius) + 20px);
+
+  /* Sidebar tokens (shadcn convention) */
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+
+  /* Chart tokens */
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+}
+
+/* =====================================================================
+   Light theme — Memphis cream + bold accents
+   ===================================================================== */
+:root {
+  /* Base radius */
+  --radius: 0.875rem;
+
+  /* Surface stack */
+  --background: oklch(0.985 0.012 75);            /* warm cream */
+  --foreground: oklch(0.18 0.02 280);             /* near-black with cool tint */
+  --surface: oklch(1 0 0);                        /* pure white cards */
+  --surface-elevated: oklch(0.995 0.005 75);      /* barely-tinted elevated */
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.18 0.02 280);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.18 0.02 280);
+
+  /* Primary — deep ink (charcoal with violet undertone) */
+  --primary: oklch(0.22 0.04 280);
+  --primary-foreground: oklch(0.985 0.012 75);
+
+  /* Secondary — soft cream surface for muted UI elements */
+  --secondary: oklch(0.95 0.018 75);
+  --secondary-foreground: oklch(0.22 0.04 280);
+
+  /* Muted — for secondary text & disabled surfaces */
+  --muted: oklch(0.94 0.015 75);
+  --muted-foreground: oklch(0.48 0.025 280);
+
+  /* Accent — Memphis coral (the hero accent color) */
+  --accent: oklch(0.65 0.22 25);                  /* coral */
+  --accent-foreground: oklch(0.99 0 0);
+
+  /* Status colors */
+  --success: oklch(0.62 0.16 145);                /* mint green */
+  --success-foreground: oklch(0.99 0 0);
+  --warning: oklch(0.78 0.17 75);                 /* warm yellow */
+  --warning-foreground: oklch(0.22 0.04 280);
+  --info: oklch(0.62 0.16 230);                   /* sky blue */
+  --info-foreground: oklch(0.99 0 0);
+  --destructive: oklch(0.58 0.23 25);             /* red-coral */
+  --destructive-foreground: oklch(0.99 0 0);
+
+  /* Borders, inputs, focus */
+  --border: oklch(0.88 0.018 75);
+  --input: oklch(0.88 0.018 75);
+  --ring: oklch(0.65 0.22 25);
+  --focus: oklch(0.65 0.22 25 / 0.35);            /* focus ring overlay */
+
+  /* Memphis accent palette — bold but controlled */
+  --memphis-coral:   oklch(0.65 0.22 25);         /* primary coral */
+  --memphis-mint:    oklch(0.72 0.16 165);        /* fresh mint */
+  --memphis-sun:     oklch(0.80 0.18 80);         /* sunny yellow */
+  --memphis-violet:  oklch(0.55 0.22 295);        /* electric violet */
+  --memphis-sky:     oklch(0.68 0.16 230);        /* sky blue */
+  --memphis-pink:    oklch(0.70 0.22 350);        /* hot pink */
+  --memphis-lemon:   oklch(0.85 0.18 95);         /* lemon */
+  --memphis-ink:     oklch(0.22 0.04 280);        /* deep ink */
+
+  /* Sidebar */
+  --sidebar: oklch(0.985 0.012 75);
+  --sidebar-foreground: oklch(0.18 0.02 280);
+  --sidebar-primary: oklch(0.22 0.04 280);
+  --sidebar-primary-foreground: oklch(0.985 0.012 75);
+  --sidebar-accent: oklch(0.95 0.018 75);
+  --sidebar-accent-foreground: oklch(0.22 0.04 280);
+  --sidebar-border: oklch(0.88 0.018 75);
+  --sidebar-ring: oklch(0.65 0.22 25);
+
+  /* Chart palette */
+  --chart-1: oklch(0.65 0.22 25);
+  --chart-2: oklch(0.72 0.16 165);
+  --chart-3: oklch(0.80 0.18 80);
+  --chart-4: oklch(0.55 0.22 295);
+  --chart-5: oklch(0.68 0.16 230);
+}
+
+/* =====================================================================
+   Dark theme — same Memphis palette, darker surfaces
+   ===================================================================== */
+.dark {
+  --background: oklch(0.16 0.018 280);            /* deep ink */
+  --foreground: oklch(0.97 0.012 75);             /* warm off-white */
+  --surface: oklch(0.21 0.02 280);                /* card surface */
+  --surface-elevated: oklch(0.245 0.025 280);     /* elevated card */
+  --card: oklch(0.21 0.02 280);
+  --card-foreground: oklch(0.97 0.012 75);
+  --popover: oklch(0.21 0.02 280);
+  --popover-foreground: oklch(0.97 0.012 75);
+
+  --primary: oklch(0.97 0.012 75);
+  --primary-foreground: oklch(0.22 0.04 280);
+
+  --secondary: oklch(0.27 0.02 280);
+  --secondary-foreground: oklch(0.97 0.012 75);
+
+  --muted: oklch(0.27 0.02 280);
+  --muted-foreground: oklch(0.70 0.02 280);
+
+  --accent: oklch(0.72 0.20 25);                  /* slightly brighter coral in dark */
+  --accent-foreground: oklch(0.16 0.018 280);
+
+  --success: oklch(0.68 0.16 145);
+  --success-foreground: oklch(0.16 0.018 280);
+  --warning: oklch(0.82 0.17 75);
+  --warning-foreground: oklch(0.16 0.018 280);
+  --info: oklch(0.68 0.16 230);
+  --info-foreground: oklch(0.16 0.018 280);
+  --destructive: oklch(0.66 0.22 25);
+  --destructive-foreground: oklch(0.99 0 0);
+
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 14%);
+  --ring: oklch(0.72 0.20 25);
+  --focus: oklch(0.72 0.20 25 / 0.35);
+
+  /* Memphis accents stay bold in dark */
+  --memphis-coral:   oklch(0.72 0.20 25);
+  --memphis-mint:    oklch(0.76 0.16 165);
+  --memphis-sun:     oklch(0.83 0.18 80);
+  --memphis-violet:  oklch(0.65 0.22 295);
+  --memphis-sky:     oklch(0.72 0.16 230);
+  --memphis-pink:    oklch(0.76 0.22 350);
+  --memphis-lemon:   oklch(0.87 0.18 95);
+  --memphis-ink:     oklch(0.97 0.012 75);
+
+  --sidebar: oklch(0.19 0.02 280);
+  --sidebar-foreground: oklch(0.97 0.012 75);
+  --sidebar-primary: oklch(0.72 0.20 25);
+  --sidebar-primary-foreground: oklch(0.16 0.018 280);
+  --sidebar-accent: oklch(0.27 0.02 280);
+  --sidebar-accent-foreground: oklch(0.97 0.012 75);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.72 0.20 25);
+
+  --chart-1: oklch(0.72 0.20 25);
+  --chart-2: oklch(0.76 0.16 165);
+  --chart-3: oklch(0.83 0.18 80);
+  --chart-4: oklch(0.65 0.22 295);
+  --chart-5: oklch(0.72 0.16 230);
+}
+
+/* =====================================================================
+   Base styles
+   ===================================================================== */
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1;
+    text-rendering: optimizeLegibility;
+  }
+  /* Reduced motion preference */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+  /* Prevent horizontal scrolling at the root */
+  html, body {
+    max-width: 100%;
+    overflow-x: clip;
+  }
+}
+
+/* =====================================================================
+   Memphis utility classes
+   ===================================================================== */
+@layer utilities {
+  /* Display font utility — used for hero headlines */
+  .font-display {
+    font-family: var(--font-display), var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: -0.025em;
+    font-weight: 800;
+  }
+
+  /* Memphis card — bold border + soft shadow + playful corner accent */
+  .memphis-card {
+    @apply relative bg-card text-card-foreground rounded-2xl border-2 border-foreground/10 shadow-[4px_4px_0_0_hsl(var(--memphis-ink)/0.08)];
+  }
+  .memphis-card-accent {
+    @apply border-[color:var(--memphis-coral)] shadow-[4px_4px_0_0_hsl(var(--memphis-coral)/0.25)];
+  }
+
+  /* Memphis button shadow — the signature offset shadow */
+  .memphis-shadow {
+    box-shadow: 4px 4px 0 0 var(--memphis-ink);
+  }
+  .memphis-shadow-coral {
+    box-shadow: 4px 4px 0 0 var(--memphis-coral);
+  }
+  .memphis-shadow-mint {
+    box-shadow: 4px 4px 0 0 var(--memphis-mint);
+  }
+  .memphis-shadow-violet {
+    box-shadow: 4px 4px 0 0 var(--memphis-violet);
+  }
+
+  /* Memphis pattern backgrounds */
+  .bg-dot-pattern {
+    background-image: radial-gradient(circle, hsl(var(--foreground) / 0.08) 1.5px, transparent 1.5px);
+    background-size: 24px 24px;
+  }
+  .bg-grid-pattern {
+    background-image:
+      linear-gradient(to right, hsl(var(--foreground) / 0.06) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--foreground) / 0.06) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+  .bg-stripe-pattern {
+    background-image: repeating-linear-gradient(
+      45deg,
+      hsl(var(--memphis-coral) / 0.06) 0px,
+      hsl(var(--memphis-coral) / 0.06) 8px,
+      transparent 8px,
+      transparent 16px
+    );
+  }
+
+  /* Hide scrollbar but keep functionality (used by horizontal tab strips) */
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* =====================================================================
+   Animations — restrained, purposeful
+   ===================================================================== */
+@keyframes memphis-float {
+  0%, 100% { transform: translateY(0px) rotate(0deg); }
+  50% { transform: translateY(-8px) rotate(2deg); }
+}
+@keyframes memphis-spin-slow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+@keyframes memphis-pulse-soft {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(0.95); }
+}
+.animate-float {
+  animation: memphis-float 6s ease-in-out infinite;
+}
+.animate-spin-slow {
+  animation: memphis-spin-slow 24s linear infinite;
+}
+.animate-pulse-soft {
+  animation: memphis-pulse-soft 2.4s ease-in-out infinite;
+}

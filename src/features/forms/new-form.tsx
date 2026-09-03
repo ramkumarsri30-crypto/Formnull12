@@ -15,12 +15,8 @@ import {
   GeometricSquare,
 } from "@/components/memphis/memphis-decorations";
 import { supabaseBrowser } from "@/lib/supabase/client";
-import type { FieldType } from "@/lib/supabase/types";
-import {
-  FIELD_TYPE_REGISTRY,
-  fieldMeta,
-  defaultConfigForType,
-} from "@/features/forms/field-types";
+import { FIELD_TYPE_REGISTRY, fieldMeta, defaultConfigForType, type FieldType } from "@/features/forms/field-types";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 /**
  * New Form page.
@@ -239,18 +235,25 @@ export function NewFormPage() {
                     placeholder="Field label"
                     disabled={saving}
                   />
-                  <select
-                    className="col-span-7 sm:col-span-4 h-9 rounded-md border border-input bg-background px-2 text-sm"
+                  <Select
                     value={f.field_type}
-                    onChange={(e) => updateField(i, { field_type: e.target.value as FieldType })}
+                    onValueChange={(v) => updateField(i, { field_type: v as FieldType })}
                     disabled={saving}
                   >
-                    {FIELD_TYPE_REGISTRY.map((t) => (
-                      <option key={t.value} value={t.value}>
-                        {t.label}
-                      </option>
-                    ))}
-                  </select>
+                    <SelectTrigger
+                      className="col-span-12 h-9 sm:col-span-4"
+                      aria-label={`Type for field ${f.label}`}
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {FIELD_TYPE_REGISTRY.map((t) => (
+                        <SelectItem key={t.value} value={t.value}>
+                          {t.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
                   <label className="col-span-3 sm:col-span-2 flex items-center gap-1 text-xs">
                     <input
                       type="checkbox"
@@ -285,7 +288,12 @@ export function NewFormPage() {
                 disabled={saving}
                 className="inline-flex items-center gap-1.5 rounded-md border border-foreground/15 bg-background px-2.5 py-1.5 text-xs font-medium transition-colors hover:border-foreground/30 hover:bg-accent/10"
               >
-                <span className="font-bold text-[color:var(--memphis-coral)]">{t.icon}</span>
+                <span className="flex h-5 w-5 items-center justify-center text-[color:var(--memphis-coral)]" aria-hidden>
+                  {(() => {
+                    const Icon = t.icon;
+                    return <Icon className="h-3.5 w-3.5" />;
+                  })()}
+                </span>
                 {t.label}
               </button>
             ))}

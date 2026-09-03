@@ -1,20 +1,24 @@
 "use client";
 
 /**
- * FormNull — Field Editor (Phase 2)
+ * FormNull — Field Editor (Phase 3)
  * =====================================================================
- * Per-field configuration editor used inside the form builder.
+ * Field properties panel used inside the form builder's right pane
+ * (desktop) / properties Sheet (tablet & mobile).
  *
  * Edits label, description, placeholder, help text, required, width
  * (1-12, matching the DB CHECK constraint) and the typed config model
- * for the field's type (options for selects, min/max/step for numbers,
- * allowed types for uploads, etc.).
+ * for the field's type (options for selects, min/max/step for numbers
+ * and scales, end labels for scales, rows for long text, allowed types
+ * for uploads).
  *
  * Saving is EXPLICIT: the Save button performs a real Supabase UPDATE.
- * While saving, controls are disabled. On failure the editor stays open
- * with the user's values preserved and a real error is shown.
+ * While saving, controls are disabled. On failure the editor stays
+ * open with the user's values preserved and a real error is shown.
+ * `onDirtyChange` reports draft-vs-saved state to the builder so it can
+ * guard selection changes and navigation (no accidental data loss).
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -53,11 +57,13 @@ export function FieldEditor({
   saving,
   onSave,
   onCancel,
+  onDirtyChange,
 }: {
   field: FormField;
   saving: boolean;
   onSave: (draft: Draft) => Promise<boolean>;
   onCancel: () => void;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const meta = fieldMeta(field.field_type);
   const kind = meta?.configKind ?? "none";
@@ -76,11 +82,13 @@ export function FieldEditor({
   function patch(p: Partial<EditableDraft>) {
     setDraft((d) => ({ ...d, ...p }));
     setValidationError(null);
+    onDirtyChange?.(true);
   }
 
   function patchConfig(p: Record<string, unknown>) {
     setDraft((d) => ({ ...d, config: { ...d.config, ...p } }));
     setValidationError(null);
+    onDirtyChange?.(true);
   }
 
   async function save() {
@@ -98,16 +106,22 @@ export function FieldEditor({
       setValidationError(configCheck.message ?? "Invalid configuration.");
       return;
     }
-    await onSave({
+    const ok = await onSave({
       label: draft.label.trim(),
       description: draft.description.trim() || null,
       placeholder: draft.placeholder.trim() || null,
       help_text: draft.help_text.trim() || null,
       is_required: draft.is_required,
       width: draft.width,
-      config: cleanConfig(kind, draft.config),
+      config: cleanConfig(kind, field.field_type, draft.config),
     });
+    if (ok) onDirtyChange?.(false);
   }
+
+  // Report clean state on mount/field switch.
+  useEffect(() => {
+    onDirtyChange?.(false);
+  }, [field.id, onDirtyChange]);
 
   const showPlaceholder =
     field.field_type === "short_text" ||
@@ -119,7 +133,21 @@ export function FieldEditor({
     field.field_type === "decimal";
 
   return (
-    <div className="rounded-xl border-2 border-foreground/15 bg-background p-4 sm:p-5">
+    <div className="space-y-4">
+      {/* Type header — what the user is configuring */}
+      <div className="flex items-center gap-2.5 rounded-xl bg-surface p-2.5">
+        <span
+          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[color:var(--memphis-coral)]/12 text-[color:var(--memphis-coral)]"
+          aria-hidden
+        >
+          {meta?.icon ? <meta.icon className="h-4 w-4" /> : null}
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-bold text-foreground">{meta?.label ?? field.field_type}</p>
+          <p className="font-mono text-[11px] text-muted-foreground">{field.field_key}</p>
+        </div>
+      </div>
+
       <div className="grid gap-4 sm:grid-cols-2">
         {/* Label */}
         <div className="space-y-2 sm:col-span-2">
@@ -137,11 +165,8 @@ export function FieldEditor({
 
         {/* field_key — machine-readable, immutable (used by submission_values) */}
         <div className="sm:col-span-2">
-          <p className="text-xs text-muted-foreground">
-            <span className="font-mono">{field.field_key}</span>{" "}
-            <span className="opacity-70">
-              · machine key (immutable — links saved answers)
-            </span>
+          <p className="text-[11px] text-muted-foreground">
+            <span className="opacity-80">machine key · immutable — links saved answers</span>
           </p>
         </div>
 
@@ -241,32 +266,40 @@ export function FieldEditor({
         )}
         {kind === "text" && (
           <TextConfigEditor
+            fieldId={field.id}
             config={draft.config}
             showPattern={field.field_type === "short_text"}
+            showRows={field.field_type === "long_text"}
             onChange={patchConfig}
             saving={saving}
           />
         )}
         {(kind === "number" || kind === "scale") && (
-          <RangeConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+          <RangeConfigEditor
+            fieldId={field.id}
+            config={draft.config}
+            showLabels={field.field_type === "scale"}
+            onChange={patchConfig}
+            saving={saving}
+          />
         )}
         {kind === "rating" && (
-          <RatingConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+          <RatingConfigEditor fieldId={field.id} config={draft.config} onChange={patchConfig} saving={saving} />
         )}
         {kind === "file" && (
-          <FileConfigEditor config={draft.config} onChange={patchConfig} saving={saving} />
+          <FileConfigEditor fieldId={field.id} config={draft.config} onChange={patchConfig} saving={saving} />
         )}
-      </div>
+    </div>
 
       {/* Validation error */}
       {validationError && (
-        <p role="alert" className="mt-3 text-xs font-medium text-destructive">
+        <p role="alert" className="text-xs font-medium text-destructive">
           {validationError}
         </p>
       )}
 
       {/* Actions */}
-      <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:justify-end">
+      <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
         <Button variant="outline" size="sm" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
@@ -365,13 +398,17 @@ function SelectOptionsEditor({
 }
 
 function TextConfigEditor({
+  fieldId,
   config,
   showPattern,
+  showRows,
   onChange,
   saving,
 }: {
+  fieldId: string;
   config: Record<string, unknown>;
   showPattern: boolean;
+  showRows: boolean;
   onChange: (p: Record<string, unknown>) => void;
   saving: boolean;
 }) {
@@ -379,8 +416,9 @@ function TextConfigEditor({
   return (
     <>
       <div className="space-y-2">
-        <Label className="text-xs">Min length</Label>
+        <Label className="text-xs" htmlFor={`minlen-${fieldId}`}>Min length</Label>
         <Input
+          id={`minlen-${fieldId}`}
           type="number"
           min={0}
           value={num(config.minLength)}
@@ -394,8 +432,9 @@ function TextConfigEditor({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs">Max length</Label>
+        <Label className="text-xs" htmlFor={`maxlen-${fieldId}`}>Max length</Label>
         <Input
+          id={`maxlen-${fieldId}`}
           type="number"
           min={1}
           value={num(config.maxLength)}
@@ -408,16 +447,36 @@ function TextConfigEditor({
           className="h-10"
         />
       </div>
+      {showRows && (
+        <div className="space-y-2">
+          <Label className="text-xs" htmlFor={`rows-${fieldId}`}>Textarea rows (2–10)</Label>
+          <Input
+            id={`rows-${fieldId}`}
+            type="number"
+            min={2}
+            max={10}
+            value={num(config.rows)}
+            onChange={(e) => onChange({ rows: e.target.value === "" ? null : Number(e.target.value) })}
+            disabled={saving}
+            className="h-10"
+          />
+          <p className="text-[11px] text-muted-foreground">Height of the answer box.</p>
+        </div>
+      )}
       {showPattern && (
         <div className="space-y-2 sm:col-span-2">
-          <Label className="text-xs">Pattern (regex, optional)</Label>
+          <Label className="text-xs" htmlFor={`pattern-${fieldId}`}>Pattern (regex, optional)</Label>
           <Input
+            id={`pattern-${fieldId}`}
             value={typeof config.pattern === "string" ? config.pattern : ""}
             onChange={(e) => onChange({ pattern: e.target.value || null })}
             disabled={saving}
             className="h-10 font-mono text-xs"
             placeholder="^[A-Z]{3}-\d{4}$"
           />
+          <p className="text-[11px] text-muted-foreground">
+            Checked as respondents type — JavaScript regex, applied to short answers.
+          </p>
         </div>
       )}
     </>
@@ -425,11 +484,15 @@ function TextConfigEditor({
 }
 
 function RangeConfigEditor({
+  fieldId,
   config,
+  showLabels,
   onChange,
   saving,
 }: {
+  fieldId: string;
   config: Record<string, unknown>;
+  showLabels: boolean;
   onChange: (p: Record<string, unknown>) => void;
   saving: boolean;
 }) {
@@ -437,8 +500,9 @@ function RangeConfigEditor({
   return (
     <>
       <div className="space-y-2">
-        <Label className="text-xs">Min</Label>
+        <Label className="text-xs" htmlFor={`min-${fieldId}`}>Min</Label>
         <Input
+          id={`min-${fieldId}`}
           type="number"
           value={num(config.min)}
           onChange={(e) =>
@@ -449,8 +513,9 @@ function RangeConfigEditor({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs">Max</Label>
+        <Label className="text-xs" htmlFor={`max-${fieldId}`}>Max</Label>
         <Input
+          id={`max-${fieldId}`}
           type="number"
           value={num(config.max)}
           onChange={(e) =>
@@ -461,8 +526,9 @@ function RangeConfigEditor({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs">Step</Label>
+        <Label className="text-xs" htmlFor={`step-${fieldId}`}>Step</Label>
         <Input
+          id={`step-${fieldId}`}
           type="number"
           min={0.01}
           step="any"
@@ -474,15 +540,45 @@ function RangeConfigEditor({
           className="h-10"
         />
       </div>
+      {showLabels && (
+        <>
+          <div className="space-y-2">
+            <Label className="text-xs" htmlFor={`leftlabel-${fieldId}`}>Left label (optional)</Label>
+            <Input
+              id={`leftlabel-${fieldId}`}
+              value={typeof config.leftLabel === "string" ? config.leftLabel : ""}
+              onChange={(e) => onChange({ leftLabel: e.target.value || null })}
+              disabled={saving}
+              className="h-10"
+              placeholder="Not at all"
+              maxLength={60}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label className="text-xs" htmlFor={`rightlabel-${fieldId}`}>Right label (optional)</Label>
+            <Input
+              id={`rightlabel-${fieldId}`}
+              value={typeof config.rightLabel === "string" ? config.rightLabel : ""}
+              onChange={(e) => onChange({ rightLabel: e.target.value || null })}
+              disabled={saving}
+              className="h-10"
+              placeholder="Absolutely"
+              maxLength={60}
+            />
+          </div>
+        </>
+      )}
     </>
   );
 }
 
 function RatingConfigEditor({
+  fieldId,
   config,
   onChange,
   saving,
 }: {
+  fieldId: string;
   config: Record<string, unknown>;
   onChange: (p: Record<string, unknown>) => void;
   saving: boolean;
@@ -490,8 +586,9 @@ function RatingConfigEditor({
   const max = typeof config.max === "number" ? config.max : 5;
   return (
     <div className="space-y-2">
-      <Label className="text-xs">Maximum rating (2–10)</Label>
+      <Label className="text-xs" htmlFor={`rating-max-${fieldId}`}>Maximum rating (2–10)</Label>
       <Input
+        id={`rating-max-${fieldId}`}
         type="number"
         min={2}
         max={10}
@@ -508,10 +605,12 @@ function RatingConfigEditor({
 }
 
 function FileConfigEditor({
+  fieldId,
   config,
   onChange,
   saving,
 }: {
+  fieldId: string;
   config: Record<string, unknown>;
   onChange: (p: Record<string, unknown>) => void;
   saving: boolean;
@@ -522,8 +621,9 @@ function FileConfigEditor({
   return (
     <>
       <div className="space-y-2">
-        <Label className="text-xs">Allowed types (comma-separated)</Label>
+        <Label className="text-xs" htmlFor={`types-${fieldId}`}>Allowed types (comma-separated)</Label>
         <Input
+          id={`types-${fieldId}`}
           value={typesStr}
           onChange={(e) =>
             onChange({
@@ -541,8 +641,9 @@ function FileConfigEditor({
         />
       </div>
       <div className="space-y-2">
-        <Label className="text-xs">Max size (MB, ≤ 100)</Label>
+        <Label className="text-xs" htmlFor={`maxsize-${fieldId}`}>Max size (MB, ≤ 100)</Label>
         <Input
+          id={`maxsize-${fieldId}`}
           type="number"
           min={1}
           max={100}
@@ -566,6 +667,7 @@ function FileConfigEditor({
 
 function cleanConfig(
   kind: string,
+  _fieldType: string,
   config: Record<string, unknown>,
 ): Record<string, unknown> {
   // Remove null/undefined values and empty strings so we never persist

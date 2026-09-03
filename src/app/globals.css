@@ -345,3 +345,26 @@
 .animate-pulse-soft {
   animation: memphis-pulse-soft 2.4s ease-in-out infinite;
 }
+
+/* =====================================================================
+   Form field grid cells (shared renderer — builder canvas, preview,
+   public form). Mobile: single column; ≥sm: the field's stored width
+   (1–12 grid columns) via --field-w. Section cells are always 12.
+   ===================================================================== */
+.form-field-cell {
+  grid-column: 1 / -1;
+}
+@media (min-width: 640px) {
+  .form-field-cell {
+    grid-column: span var(--field-w, 12);
+  }
+}
+
+/* Builder canvas: the field preview inside a card is visually exact but
+   interaction-inert — pointer events pass through to the card itself,
+   so clicking ANY part of a field (including its inputs) selects the
+   field. Without this, disabled form controls would swallow clicks. */
+.builder-inert,
+.builder-inert * {
+  pointer-events: none;
+}

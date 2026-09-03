@@ -312,6 +312,44 @@ export interface Database {
         Args: { p_workspace_id: string };
         Returns: boolean;
       };
+      /**
+       * Publish the form as an immutable version snapshot + flip status
+       * to 'published' (migration 006). SECURITY DEFINER RPC: re-checks
+       * editor rights server-side; validates every field's config;
+       * enforces the 300-field / 512KiB-snapshot caps; rejects forms
+       * containing file_upload fields (anonymous uploads arrive later).
+       */
+      publish_form: {
+        Args: { p_form_id: string };
+        Returns: { public_key: string; version: number };
+      };
+      /**
+       * Snapshot-only public read (migration 006): name, description,
+       * settings, version, status, published_at + the frozen fields
+       * array (key/type/label/description/placeholder/help_text/
+       * required/config/sort_order/width). Serves 'published' and
+       * 'paused' forms; unknown keys → NOT_FOUND (no existence oracle).
+       */
+      get_public_form: {
+        Args: { p_public_key: string };
+        Returns: Record<string, unknown>;
+      };
+      /**
+       * Anonymous submission (migration 006): validates every answer
+       * against the published snapshot (14 submittable types), rate
+       * limits 20/10min per hashed IP, honeypot-first fake success,
+       * atomic submission + values insert, server-derived
+       * workspace_id/submitted_by. Returns ok + sequential reference.
+       */
+      submit_public_form: {
+        Args: {
+          p_public_key: string;
+          p_values: Record<string, unknown>;
+          p_honeypot?: string | null;
+          p_meta?: Record<string, unknown> | null;
+        };
+        Returns: { ok: boolean; reference: number | null };
+      };
     };
     Enums: {
       workspace_role: WorkspaceRole;

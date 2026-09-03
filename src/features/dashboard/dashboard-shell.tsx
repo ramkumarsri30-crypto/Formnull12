@@ -25,6 +25,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/features/auth/auth-provider";
+import { useIsMobile } from "@/hooks/use-mobile";
 import {
   WorkspaceProvider,
   useWorkspaceCtx,
@@ -215,6 +216,13 @@ function SidebarContent({
     switching,
   } = useWorkspaceCtx();
   const [createOpen, setCreateOpen] = useState(false);
+  // Mobile (<768px): the workspace-selector dropdown must open BELOW the
+  // trigger (side="bottom"). With side="right" the w-60 menu renders beside
+  // the drawer's full-width trigger and overflows narrow viewports
+  // (right edge ≈ 518px on a 375px screen), putting every menu item outside
+  // the viewport. Desktop (≥768px) keeps the established side="right"
+  // pop-out-over-content positioning unchanged.
+  const isMobile = useIsMobile();
 
   const userEmail = user?.email ?? "";
   const workspaceName = currentWorkspace?.name ?? (loading ? "Loading…" : "No workspace");
@@ -262,7 +270,7 @@ function SidebarContent({
           </DropdownMenuTrigger>
           <DropdownMenuContent
             align="start"
-            side="right"
+            side={isMobile ? "bottom" : "right"}
             className="w-60 max-w-[calc(100vw-2rem)]"
           >
             <DropdownMenuLabel>Your workspaces</DropdownMenuLabel>

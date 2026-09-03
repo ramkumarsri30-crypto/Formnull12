@@ -124,4 +124,22 @@ report("A reads own workspace", r, "1 row", r.status === 200 && r.body.includes(
 r = await get(tokenB, `workspaces?id=eq.${B_WS}&select=id,name`);
 report("B reads own workspace", r, "1 row", r.status === 200 && r.body.includes("formnull.b"));
 
+
+// ---------- new workspace from the FINAL E2E (created via RPC) ----------
+console.log("\n— NEW 'Phase 2A Final Workspace Test' workspace isolation —");
+
+const NEW_WS = "6c5038ab-a7a8-4d2c-9736-f629c5975d54";
+
+r = await get(tokenB, `workspaces?id=eq.${NEW_WS}&select=id,name`);
+report("B reads A's new workspace", r, "empty []", r.status === 200 && r.body.trim() === "[]");
+
+r = await get(tokenB, `forms?workspace_id=eq.${NEW_WS}&select=id`);
+report("B lists A's new workspace forms", r, "empty []", r.status === 200 && r.body.trim() === "[]");
+
+r = await post(tokenB, "workspace_members", { workspace_id: NEW_WS, user_id: "63b52b9f-87ba-411f-ad33-f40102149240", role: "owner" });
+report("B inserts membership into A's new workspace", r, "403/RLS", r.status === 403 || r.status === 404);
+
+r = await get(tokenA, `workspaces?id=eq.${NEW_WS}&select=id,name`);
+report("A (owner) reads own new workspace", r, "1 row", r.status === 200 && r.body.includes("Phase 2A Final"));
+
 console.log("\nDone.");

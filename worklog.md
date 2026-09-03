@@ -54,3 +54,29 @@ Stage Summary:
 - All audit-identified code fixes (A/B/C/D) implemented and runtime-verified; Memphis/playful-geometric UI untouched (responsive-only verification)
 - Phase 2 implementation is now runtime-verified: workspace real data, dashboard real counts, create-form persistence, 16-type builder CRUD + validation + reorder + rollback, responsive 320–2560, tenant isolation RLS
 - Known remaining: auth-init transient (needs investigation in a later phase), Turbopack dev-server V8 heap growth (~1 GB per ~10 compiles — mitigated by cap + planned restarts), 5 deferred field types (datetime, page_break, signature, address, matrix), orphan debug-test-ws cleanup SQL prepared but not executed, legacy secret in git history (rotation recommended)
+
+---
+Task ID: 3
+Agent: Super Z (main)
+Task: Phase 2A FINAL VERIFICATION — close the remaining gap (migration 005 applied manually by owner) and verify the existing implementation; NO Phase 3, NO new migrations
+
+Work Log:
+- Safety checkpoint: git HEAD ff82806 (= c690d4b + screenshots/tool-results only, working tree clean); .env.local intact with correct var names; dev server down → started via double-fork pattern (sandbox reaps process trees between tool calls; double-fork orphans survive — same mechanism agent-browser uses)
+- Migration 005 verification (scripts/phase2a-verify-005.ts, all read-only probes): anon EXECUTE denied (PG 42501 permission denied for function); service key without user JWT → AUTH_REQUIRED (auth.uid() guard live); authenticated executes real body (INVALID_NAME on blank name); forged user_id/workspace_id params → PGRST202 (signature has only p_name/p_description → cross-tenant membership impossible by construction); row counts unchanged by probes; ALL PROBES PASSED. (OpenAPI-spec probe removed: this project's REST gateway returns an empty paths list even for tables.)
+- Orphan debug-test-ws: verified exact identity match (id 2d618272…, slug debug-test-ws, 0 members, 0 forms, owner formnull.test) → removed per owner authorization with id+slug guards; all other rows untouched
+- REAL UI E2E creation (scripts/phase2a-final-e2e.sh): sign-in → selector → "Create workspace" menuitem → Memphis dialog opens → name/description filled → POST /rest/v1/rpc/create_workspace 200 on the wire → toast "Workspace created! Switched to …" → dashboard re-queries new ws (No forms yet) → PATCH profiles 204 (default_workspace_id)
+- DB verification (scripts/phase2a-verify-db-after.ts): exactly 1 new workspace + 1 owner membership (role=owner, user_id=creator auth.uid()), default_workspace_id=6c5038ab…, no orphans anywhere, no duplicates, previous ws intact (2 forms), totals unchanged — ALL DB CHECKS PASSED
+- Real switch E2E: selector lists all 3 of A's workspaces; ref-based switch to formnull-test ws shows its 2 real forms, default_workspace_id follows (DB-verified both directions); sign out → 0 sb- cookies; re-signin → default ws loads correctly
+- RLS isolation re-run (scripts/phase2a-isolation.ts + new-workspace checks): 19/19 PASS (B↔A empty reads, membership inserts 42501, rename no-op, positive controls, new ws protected)
+- Auth-init "Loading…" transient INVESTIGATED per §5: root cause captured live — Turbopack ChunkLoadError (dev overlay "Runtime ChunkLoadError", "Next.js 16.1.3 (stale)") → React never hydrates (0 hydrated elements) → no effects → no network calls → Loading… forever; recovers on reload. Repro ~1-in-5 reloads + first load after server restart; dev-only mechanism, zero app-console errors; NOT classified as environmental without evidence (ChunkLoadError + hydration counter are the evidence)
+- Responsive (§7): found REAL bug — workspace-selector DropdownMenuContent side="right" inside the mobile drawer overflowed viewports ≤390px (menu right edge ≈518px on 375px screen → menuitems unreachable by pointer). Minimal Memphis-preserving fix in dashboard-shell.tsx: side={isMobile ? "bottom" : "right"} via existing useIsMobile hook (desktop ≥768 unchanged, verified menu x=246 popout preserved). After fix: all 11 widths (320/375/390/414/480/768/1024/1280/1440/1920/2560) PASS — dialog fits, buttons usable, 0 horizontal overflow, mobile drawer works
+- Final gates: npx tsc --noEmit --incremental false → EXIT 0; npx eslint src/ → EXIT 0
+- Dev-server memory: V8 heap cap (1024MB) hit twice by documented Turbopack heap growth → clean process death (machine never OOM'd, 3GB+ always free); restarted at suite boundaries; dev.log appends verified NOT to trigger rebuilds
+
+Stage Summary:
+- Migration 005 verified applied and secure (5/5 behavioral probes); orphan workspace removed after 4-condition identity match
+- Workspace creation: all 18 checklist items PASS with real DB + network evidence
+- RLS isolation 19/19 PASS; session/sign-out/sign-in PASS; responsive 11/11 PASS after 1 minimal fix
+- ONLY src change: dashboard-shell.tsx +9/-1 (responsive dropdown side) — Memphis visual identity untouched
+- Known issues documented (not fixed — no speculative changes): Turbopack ChunkLoadError dev flake (~1/5 loads, recovers on reload, dev-only); migration 005 slug derivation applies regexp_replace before lower() → uppercase letters consumed (slug "hase-2-inal-orkspace-est"; cosmetic only — slug unused in app; fix = reorder lower() first in a future maintenance window); favicon 404 (harness artifact)
+- PHASE 2A VERIFIED AND CLOSED

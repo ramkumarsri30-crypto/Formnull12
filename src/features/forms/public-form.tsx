@@ -29,6 +29,7 @@ import {
 } from "@/components/memphis/memphis-decorations";
 import { Logo } from "@/components/formnull/logo";
 import { supabaseBrowser } from "@/lib/supabase/client";
+import { isSubmittableType } from "./field-registry";
 import {
   FormRenderer,
   snapshotToModel,
@@ -155,7 +156,10 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
       clean[k] = v;
     }
     // Defense-in-depth: never send unknown keys (006 rejects them).
-    const known = new Set(state.fields.filter((f) => f.field_type !== "section" && f.field_type !== "file_upload").map((f) => f.field_key));
+    // Registry-driven: only types submit_public_form accepts.
+    const known = new Set(
+      state.fields.filter((f) => isSubmittableType(f.field_type)).map((f) => f.field_key),
+    );
     const payload: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(clean)) {
       if (known.has(k)) payload[k] = v;

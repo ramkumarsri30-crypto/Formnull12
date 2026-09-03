@@ -61,6 +61,7 @@ import {
   Sigma,
   SquareCheck,
   Calendar,
+  CalendarClock,
   Clock,
   ChevronDown,
   ListChecks,
@@ -68,6 +69,11 @@ import {
   SlidersHorizontal,
   Upload,
   Heading2,
+  Gauge,
+  ListOrdered,
+  MoveHorizontal,
+  Table2,
+  MapPin,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -107,7 +113,10 @@ export type PropertyControl =
   | "width"
   | "select"
   | "options-editor"
-  | "default-country";
+  | "default-country"
+  | "date"
+  | "datetime"
+  | "config-switch";
 
 export interface PropertyDefinition {
   /** config key (target=config) or column name (target=column). */
@@ -131,6 +140,12 @@ export interface PropertyDefinition {
   visibleWhenPresent?: boolean;
   /** Choices for control="select". */
   choices?: { value: string; label: string }[];
+  /** For control="options-editor": which config pair the list edits.
+   *  Defaults to options/optionLabels; matrix rows use rows/rowLabels
+   *  and columns use columns/columnLabels. */
+  optionKeys?: { values: string; labels: string };
+  /** For control="config-switch": value used when the key is absent. */
+  defaultOn?: boolean;
 }
 
 /* ------------------------------------------------------------------ */
@@ -138,20 +153,43 @@ export interface PropertyDefinition {
 /* ------------------------------------------------------------------ */
 
 /** Library grouping for ACTIVE types (the mental model of the rail). */
-export type FieldGroup = "text" | "contact" | "numbers" | "choice";
+export type FieldGroup = "text" | "contact" | "numbers" | "choice" | "datetime";
 
 export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
   { key: "text", label: "Text" },
   { key: "contact", label: "Contact" },
   { key: "numbers", label: "Numbers" },
   { key: "choice", label: "Choice" },
+  { key: "datetime", label: "Date & time" },
 ];
 
 /**
  * The JSON shape one submitted answer takes. The axis every future
- * Logic / Calculation / Integration ruleset branches on.
+ * Logic / Calculation / Integration ruleset branches on. `"record"` is
+ * a map of stable keys to values (matrix: row→column; address: part
+ * name→text).
  */
-export type AnswerType = "string" | "number" | "boolean" | "string[]" | "none";
+export type AnswerType =
+  | "string"
+  | "number"
+  | "boolean"
+  | "string[]"
+  | "record"
+  | "none";
+
+/**
+ * Field System 2.0 statuses:
+ *   active  : offered in the field library — full end-to-end support
+ *             (builder, publish, public form, submission) TODAY.
+ *   staged  : fully implemented in the app but NOT offered yet. Their
+ *             server contract lands in migration 007 (extending
+ *             submit_public_form's submittable-type whitelist). Flip to
+ *             active only after 007 is applied and verified — exposing
+ *             them before that would ship fields that cannot collect.
+ *   legacy  : NOT offered for new fields; existing forms keep working
+ *             through this same registry (compatibility layer).
+ */
+export type FieldStatus = "active" | "staged" | "legacy";
 
 export interface FieldTypeDef {
   value: FieldType;
@@ -160,11 +198,13 @@ export interface FieldTypeDef {
   /** One-line explanation (library + canvas badges). */
   description: string;
   group?: FieldGroup;
-  /** active = addable in the library. legacy = compatibility only. */
-  status: "active" | "legacy";
+  status: FieldStatus;
   answerType: AnswerType;
   collectsData: boolean;
   publishable: boolean;
+  /** submit_public_form (006) accepts answers for this type. Mirrors
+   *  006's c_submittable — the public form only sends submittable keys. */
+  submittable: boolean;
   defaultLabel: string;
   /** Config written on field creation (selects need valid options). */
   defaultConfig: () => Record<string, unknown>;
@@ -350,6 +390,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Short text",
     defaultConfig: () => ({}),
     properties: [
@@ -387,6 +428,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Long text",
     defaultConfig: () => ({ rows: 4 }),
     properties: [
@@ -425,6 +467,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Email",
     defaultConfig: () => ({}),
     properties: [
@@ -449,6 +492,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Phone number",
     defaultConfig: () => ({}),
     properties: [
@@ -499,6 +543,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "number",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Number",
     defaultConfig: () => ({}),
     properties: [
@@ -526,6 +571,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "number",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Decimal",
     defaultConfig: () => ({}),
     properties: [
@@ -565,6 +611,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Dropdown",
     defaultConfig: () => ({ options: ["Option 1", "Option 2"] }),
     properties: [
@@ -602,6 +649,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string[]",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Multi-select",
     defaultConfig: () => ({ options: ["Option 1", "Option 2"] }),
     properties: [
@@ -620,6 +668,15 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
         hint: "Each option has a display label and a stable value that is stored in responses",
         fullWidth: true,
       },
+      {
+        key: "ranked",
+        label: "Ranking mode",
+        section: "behavior",
+        target: "config",
+        control: "config-switch",
+        defaultOn: false,
+        hint: "Respondents put every option in order — the answer is stored as an ordered list",
+      },
     ],
     validationNote:
       "Answers must match option values, with no duplicates — enforced on every public submission (server-side).",
@@ -635,6 +692,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "boolean",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Checkbox",
     defaultConfig: () => ({}),
     properties: [
@@ -669,6 +727,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "number",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Rating",
     defaultConfig: () => ({ max: 5 }),
     properties: [
@@ -717,17 +776,19 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       "Answers are whole numbers from 1 to the scale — enforced on every public submission (server-side).",
   },
 
-  /* ── LEGACY (existing forms only — full compatibility) ─────────── */
+  /* ── PHASE 2 — upgraded legacy types (now active) + staged types ── */
 
   {
     value: "url",
     label: "Website",
     icon: Link2,
-    description: "URL with built-in format validation.",
-    status: "legacy",
+    description: "Web address (https://…) with format validation.",
+    group: "text",
+    status: "active",
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Website",
     defaultConfig: () => ({}),
     properties: [
@@ -735,7 +796,10 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       P_DESCRIPTION,
       P_REQUIRED,
       P_WIDTH,
-      P_PLACEHOLDER,
+      {
+        ...P_PLACEHOLDER,
+        placeholder: "https://",
+      },
       P_HELP,
       P_MIN_LENGTH,
       P_MAX_LENGTH,
@@ -748,11 +812,13 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     value: "date",
     label: "Date",
     icon: Calendar,
-    description: "A calendar date picker (YYYY-MM-DD).",
-    status: "legacy",
+    description: "A calendar date (YYYY-MM-DD) with an optional range.",
+    group: "datetime",
+    status: "active",
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Date",
     defaultConfig: () => ({}),
     properties: [
@@ -761,6 +827,24 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       P_REQUIRED,
       P_WIDTH,
       P_HELP,
+      {
+        key: "minDate",
+        label: "Earliest date",
+        section: "validation",
+        target: "config",
+        control: "date",
+        enforcement: "client",
+        hint: "Answers before this date are rejected in the browser",
+      },
+      {
+        key: "maxDate",
+        label: "Latest date",
+        section: "validation",
+        target: "config",
+        control: "date",
+        enforcement: "client",
+        hint: "Answers after this date are rejected in the browser",
+      },
     ],
     validationNote:
       "Answers must be real calendar dates in YYYY-MM-DD form — enforced on every public submission (server-side).",
@@ -771,10 +855,12 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     label: "Time",
     icon: Clock,
     description: "A time of day picker (24-hour HH:MM).",
-    status: "legacy",
+    group: "datetime",
+    status: "active",
     answerType: "string",
     collectsData: true,
     publishable: true,
+    submittable: true,
     defaultLabel: "Time",
     defaultConfig: () => ({}),
     properties: [
@@ -790,15 +876,17 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
 
   {
     value: "scale",
-    label: "Scale",
+    label: "Opinion scale",
     icon: SlidersHorizontal,
-    description: "Numbered scale (e.g. 1–10) with optional end labels.",
-    status: "legacy",
+    description: "Numbered scale respondents tap — 1–5, 0–10, any range.",
+    group: "choice",
+    status: "active",
     answerType: "number",
     collectsData: true,
     publishable: true,
-    defaultLabel: "Scale",
-    defaultConfig: () => ({}),
+    submittable: true,
+    defaultLabel: "Opinion scale",
+    defaultConfig: () => ({ min: 1, max: 5, step: 1 }),
     properties: [
       P_LABEL,
       P_DESCRIPTION,
@@ -826,10 +914,194 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
         enforcement: "presentation",
         placeholder: "Absolutely",
       },
+      {
+        key: "style",
+        label: "Style",
+        section: "appearance",
+        target: "config",
+        control: "select",
+        enforcement: "presentation",
+        choices: [
+          { value: "buttons", label: "Buttons" },
+          { value: "slider", label: "Slider" },
+        ],
+        placeholder: "Auto",
+        hint: "Auto picks buttons for short scales and a slider for long ones",
+      },
     ],
     validationNote:
       "Answers must land on a scale step — enforced on every public submission (server-side).",
   },
+
+  /* ── STAGED — implemented, waiting for migration 007 ──────────────
+   * These definitions are complete (properties, controls, validation,
+   * renderer). They are NOT offered in the field library and publish
+   * is blocked for them until 007 (which extends submit_public_form's
+   * submittable whitelist) is applied by the owner and verified. Flip
+   * status + submittable + publishable to activate after 007.
+   * Test rows can be inserted directly via the service key. */
+
+  {
+    value: "datetime",
+    label: "Date & time",
+    icon: CalendarClock,
+    description: "A date together with a time of day.",
+    group: "datetime",
+    status: "staged",
+    answerType: "string",
+    collectsData: true,
+    publishable: false,
+    submittable: false,
+    defaultLabel: "Date & time",
+    defaultConfig: () => ({}),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+      {
+        key: "minDate",
+        label: "Earliest moment",
+        section: "validation",
+        target: "config",
+        control: "datetime",
+        enforcement: "client",
+        hint: "Answers before this moment are rejected in the browser",
+      },
+      {
+        key: "maxDate",
+        label: "Latest moment",
+        section: "validation",
+        target: "config",
+        control: "datetime",
+        enforcement: "client",
+        hint: "Answers after this moment are rejected in the browser",
+      },
+    ],
+    validationNote:
+      "Answers use the YYYY-MM-DD HH:MM local format. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+  },
+
+  {
+    value: "matrix",
+    label: "Matrix",
+    icon: Table2,
+    description: "A grid of rows and columns — one choice per row.",
+    group: "choice",
+    status: "staged",
+    answerType: "record",
+    collectsData: true,
+    publishable: false,
+    submittable: false,
+    defaultLabel: "Matrix",
+    defaultConfig: () => ({
+      rows: ["Row 1", "Row 2"],
+      columns: ["Column 1", "Column 2", "Column 3"],
+    }),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+      {
+        key: "rows",
+        label: "Rows",
+        section: "options",
+        target: "config",
+        control: "options-editor",
+        optionKeys: { values: "rows", labels: "rowLabels" },
+        enforcement: "server",
+        hint: "Each row has a display label and a stable value stored in responses",
+        fullWidth: true,
+      },
+      {
+        key: "columns",
+        label: "Columns",
+        section: "options",
+        target: "config",
+        control: "options-editor",
+        optionKeys: { values: "columns", labels: "columnLabels" },
+        enforcement: "server",
+        hint: "Choices offered for every row — one is picked per row",
+        fullWidth: true,
+      },
+    ],
+    validationNote:
+      "Every row must map to one of the offered columns. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+  },
+
+  {
+    value: "address",
+    label: "Address",
+    icon: MapPin,
+    description: "Street, city, postal code and country as one answer.",
+    group: "contact",
+    status: "staged",
+    answerType: "record",
+    collectsData: true,
+    publishable: false,
+    submittable: false,
+    defaultLabel: "Address",
+    defaultConfig: () => ({
+      showLine2: false,
+      showState: true,
+      showPostal: true,
+      showCountry: true,
+    }),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+      {
+        key: "showLine2",
+        label: "Address line 2",
+        section: "appearance",
+        target: "config",
+        control: "config-switch",
+        enforcement: "presentation",
+        defaultOn: false,
+        hint: "Show the optional second street line",
+      },
+      {
+        key: "showState",
+        label: "State / region",
+        section: "appearance",
+        target: "config",
+        control: "config-switch",
+        enforcement: "presentation",
+        defaultOn: true,
+        hint: "Show the state or region input",
+      },
+      {
+        key: "showPostal",
+        label: "Postal code",
+        section: "appearance",
+        target: "config",
+        control: "config-switch",
+        enforcement: "presentation",
+        defaultOn: true,
+        hint: "Show the postal code input",
+      },
+      {
+        key: "showCountry",
+        label: "Country",
+        section: "appearance",
+        target: "config",
+        control: "config-switch",
+        enforcement: "presentation",
+        defaultOn: true,
+        hint: "Show the country selector",
+      },
+    ],
+    validationNote:
+      "A required address needs street, city and country. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+  },
+
+  /* ── LEGACY (existing forms only — full compatibility) ─────────── */
 
   {
     value: "section",
@@ -840,6 +1112,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "none",
     collectsData: false,
     publishable: true,
+    submittable: false,
     defaultLabel: "Section",
     defaultConfig: () => ({}),
     properties: [
@@ -869,6 +1142,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     answerType: "string",
     collectsData: true,
     publishable: false,
+    submittable: false,
     defaultLabel: "File upload",
     defaultConfig: () => ({}),
     properties: [
@@ -933,6 +1207,155 @@ export const FIELD_TYPES_BY_GROUP: Record<FieldGroup, FieldTypeDef[]> =
     },
     {} as Record<FieldGroup, FieldTypeDef[]>,
   );
+
+/* ------------------------------------------------------------------ */
+/* Library presets                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A library preset is a ready-to-use starting point for an EXISTING
+ * field type — NPS and Slider are both opinion scales, Ranking is a
+ * ranked multi-select. This is deliberately NOT a second field-
+ * definition architecture: presets only change the defaults a new
+ * field is created with (label + config). The FieldTypeDef remains
+ * the single source of truth for properties, validation and
+ * rendering; answers validate exactly like the base type.
+ */
+export interface LibraryPreset {
+  /** Unique library id (never a FieldType value). */
+  id: string;
+  type: FieldType;
+  label: string;
+  icon: LucideIcon;
+  description: string;
+  group: FieldGroup;
+  defaultLabel: string;
+  defaultConfig: () => Record<string, unknown>;
+}
+
+export const FIELD_PRESETS: LibraryPreset[] = [
+  {
+    id: "nps",
+    type: "scale",
+    label: "NPS score",
+    icon: Gauge,
+    description: "The 0–10 recommendation question with end labels.",
+    group: "choice",
+    defaultLabel: "How likely are you to recommend us?",
+    defaultConfig: () => ({
+      min: 0,
+      max: 10,
+      step: 1,
+      leftLabel: "Not likely",
+      rightLabel: "Extremely likely",
+    }),
+  },
+  {
+    id: "slider",
+    type: "scale",
+    label: "Slider",
+    icon: MoveHorizontal,
+    description: "A draggable numeric track instead of tappable buttons.",
+    group: "choice",
+    defaultLabel: "Slider",
+    defaultConfig: () => ({ min: 0, max: 100, step: 1, style: "slider" }),
+  },
+  {
+    id: "ranking",
+    type: "multi_select",
+    label: "Ranking",
+    icon: ListOrdered,
+    description: "Respondents put every option in preference order.",
+    group: "choice",
+    defaultLabel: "Rank your preferences",
+    defaultConfig: () => ({
+      ranked: true,
+      options: ["Option 1", "Option 2", "Option 3"],
+    }),
+  },
+];
+
+/* ------------------------------------------------------------------ */
+/* Library entries — what "Add field" actually offers                  */
+/* ------------------------------------------------------------------ */
+
+export interface LibraryEntry {
+  /** def value or preset id — unique per library. */
+  key: string;
+  type: FieldType;
+  label: string;
+  icon: LucideIcon;
+  description: string;
+  group: FieldGroup;
+  defaultLabel: string;
+  defaultConfig: () => Record<string, unknown>;
+}
+
+function entryFromDef(d: FieldTypeDef): LibraryEntry {
+  return {
+    key: d.value,
+    type: d.value,
+    label: d.label,
+    icon: d.icon,
+    description: d.description,
+    group: d.group ?? "text",
+    defaultLabel: d.defaultLabel,
+    defaultConfig: d.defaultConfig,
+  };
+}
+
+function entryFromPreset(p: LibraryPreset): LibraryEntry {
+  return {
+    key: p.id,
+    type: p.type,
+    label: p.label,
+    icon: p.icon,
+    description: p.description,
+    group: p.group,
+    defaultLabel: p.defaultLabel,
+    defaultConfig: p.defaultConfig,
+  };
+}
+
+/** Everything addable in one flat list: active defs + presets. */
+export const LIBRARY_ENTRIES: LibraryEntry[] = [
+  ...ADDABLE_FIELD_TYPES.map(entryFromDef),
+  ...FIELD_PRESETS.map(entryFromPreset),
+];
+
+export const LIBRARY_BY_GROUP: Record<FieldGroup, LibraryEntry[]> =
+  FIELD_GROUPS.reduce(
+    (acc, g) => {
+      acc[g.key] = LIBRARY_ENTRIES.filter((e) => e.group === g.key);
+      return acc;
+    },
+    {} as Record<FieldGroup, LibraryEntry[]>,
+  );
+
+/** Resolve a library entry back from a saved row's type + config
+ *  (used by the builder to describe what a field "is" — e.g. an NPS
+ *  preset). Falls back to the base def label. */
+export function libraryLabelFor(
+  type: FieldType,
+  config: Record<string, unknown> | null | undefined,
+): string {
+  if (type === "scale" && config?.style === "slider") return "Slider";
+  if (type === "scale" && config?.min === 0 && config?.max === 10) {
+    // NPS-shaped scale (0–10 + likely labels) — only claim NPS when the
+    // end labels match the preset, otherwise it is a plain scale.
+    const l = typeof config.leftLabel === "string" ? config.leftLabel : "";
+    const r = typeof config.rightLabel === "string" ? config.rightLabel : "";
+    if (/not.{0,3}likely/i.test(l) && /extremely likely/i.test(r)) return "NPS score";
+  }
+  if (type === "multi_select" && config?.ranked === true) return "Ranking";
+  return fieldDefSafe(type)?.label ?? type;
+}
+
+/** Does submit_public_form (006) accept answers for this type? The
+ *  public form only sends keys whose type is submittable. */
+export function isSubmittableType(type: FieldType): boolean {
+  return fieldDefSafe(type)?.submittable ?? false;
+}
 
 /* Compatibility aliases (existing call sites). */
 export const fieldMeta = fieldDefSafe;
@@ -1026,6 +1449,12 @@ export function validateOptions(
  * database. Mirrors publish_form() so nothing valid here can fail
  * there, and nothing invalid here can silently pass there.
  */
+function labelMap(v: unknown): Record<string, string> {
+  return v && typeof v === "object" && !Array.isArray(v)
+    ? (v as Record<string, string>)
+    : {};
+}
+
 export function validateConfig(
   type: FieldType,
   config: Record<string, unknown>,
@@ -1107,6 +1536,71 @@ export function validateConfig(
               message: `${k === "leftLabel" ? "Left" : "Right"} label must be at most ${MAX_END_LABEL_LEN} characters.`,
             };
           }
+        }
+      }
+      return { ok: true };
+    }
+
+    case "date": {
+      const iso = (v: unknown) =>
+        typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(new Date(`${v}T00:00:00Z`).getTime());
+      if (config.minDate != null && !iso(config.minDate)) {
+        return { ok: false, message: "Earliest date must be a valid YYYY-MM-DD date." };
+      }
+      if (config.maxDate != null && !iso(config.maxDate)) {
+        return { ok: false, message: "Latest date must be a valid YYYY-MM-DD date." };
+      }
+      if (
+        iso(config.minDate) && iso(config.maxDate) &&
+        String(config.minDate) > String(config.maxDate)
+      ) {
+        return { ok: false, message: "Earliest date must be before the latest date." };
+      }
+      return { ok: true };
+    }
+
+    case "datetime": {
+      const iso = (v: unknown) =>
+        typeof v === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(v);
+      if (config.minDate != null && !iso(config.minDate)) {
+        return { ok: false, message: "Earliest moment must be YYYY-MM-DD HH:MM (as picked by the date-time control)." };
+      }
+      if (config.maxDate != null && !iso(config.maxDate)) {
+        return { ok: false, message: "Latest moment must be YYYY-MM-DD HH:MM (as picked by the date-time control)." };
+      }
+      if (
+        iso(config.minDate) && iso(config.maxDate) &&
+        String(config.minDate) > String(config.maxDate)
+      ) {
+        return { ok: false, message: "Earliest moment must be before the latest moment." };
+      }
+      return { ok: true };
+    }
+
+    case "matrix": {
+      const rows = Array.isArray(config.rows) ? (config.rows as unknown[]) : null;
+      const columns = Array.isArray(config.columns) ? (config.columns as unknown[]) : null;
+      if (!rows || !columns) {
+        return { ok: false, message: "Matrix needs both rows and columns." };
+      }
+      const rowCheck = validateOptions(rows.filter((r): r is string => typeof r === "string") as string[], labelMap(config.rowLabels));
+      if (!rowCheck.ok) {
+        return { ok: false, message: rowCheck.message?.replace("option", "row").replace("Option", "Row") ?? "Invalid rows." };
+      }
+      const colCheck = validateOptions(columns.filter((c): c is string => typeof c === "string") as string[], labelMap(config.columnLabels));
+      if (!colCheck.ok) {
+        return { ok: false, message: colCheck.message?.replace("option", "column").replace("Option", "Column") ?? "Invalid columns." };
+      }
+      if (rows.length === 0 || columns.length === 0) {
+        return { ok: false, message: "Matrix needs at least one row and one column." };
+      }
+      return { ok: true };
+    }
+
+    case "address": {
+      for (const k of ["showLine2", "showState", "showPostal", "showCountry"] as const) {
+        if (config[k] != null && typeof config[k] !== "boolean") {
+          return { ok: false, message: "Address part visibility must be on or off." };
         }
       }
       return { ok: true };

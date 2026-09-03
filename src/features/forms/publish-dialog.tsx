@@ -74,7 +74,7 @@ export function PublishDialog({
   formId,
   formName,
   fieldCount,
-  hasFileUpload,
+  blockedTypes,
   onPublished,
 }: {
   open: boolean;
@@ -82,7 +82,10 @@ export function PublishDialog({
   formId: string;
   formName: string;
   fieldCount: number;
-  hasFileUpload: boolean;
+  /** Labels of field types present in the form that cannot be
+   *  published yet (registry publishable=false — file upload, staged
+   *  types). The RPC explains the same thing server-side. */
+  blockedTypes: string[];
   onPublished: (result: { publicKey: string; version: number }) => void;
 }) {
   const [publishing, setPublishing] = useState(false);
@@ -221,15 +224,17 @@ export function PublishDialog({
                 <Check className="mt-0.5 h-4 w-4 shrink-0 text-[color:var(--memphis-mint)]" aria-hidden />
                 <span>Rate limited to 20 submissions per 10 minutes per visitor IP.</span>
               </li>
-              {hasFileUpload && (
+              {blockedTypes.length > 0 && (
                 <li className="flex items-start gap-2">
                   <TriangleAlert
                     className="mt-0.5 h-4 w-4 shrink-0 text-[color:var(--memphis-sun)]"
                     aria-hidden
                   />
                   <span>
-                    This form contains <strong>file upload fields</strong> — publishing will be
-                    rejected until they are removed (anonymous uploads arrive in a later phase).
+                    This form contains <strong>{blockedTypes.join(", ")} fields</strong>.
+                    Publishing is blocked while they are present — these types cannot
+                    collect responses yet. Remove them to publish (full support arrives
+                    with the pending server migration).
                   </span>
                 </li>
               )}
@@ -256,7 +261,8 @@ export function PublishDialog({
               <Button
                 variant="memphis-coral"
                 onClick={doPublish}
-                disabled={publishing}
+                disabled={publishing || blockedTypes.length > 0}
+                aria-disabled={blockedTypes.length > 0}
                 className="w-full sm:w-auto"
               >
                 <Rocket className="h-4 w-4" />

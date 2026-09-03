@@ -3,10 +3,10 @@
 /**
  * FormNull — Field Library (Field System 2.0)
  * =====================================================================
- * The "Add field" surface. Shows ONLY the registry's ACTIVE types (the
- * first 10 of the rebuild) grouped by mental model and searchable.
- * Legacy types living in existing forms are deliberately absent — they
- * keep working through the registry, but new fields start here.
+ * The "Add field" surface. Shows every ACTIVE field type plus the
+ * library presets (NPS, Slider, Ranking — ready-to-use starting points
+ * that instantiate an existing type with tuned defaults). Staged and
+ * legacy types living in existing forms are deliberately absent.
  *
  * Rendered in three contexts:
  *   - the builder's collapsible rail overlay (desktop)
@@ -14,7 +14,12 @@
  *   - the mobile "Add field" sheet
  */
 import { useMemo, useState } from "react";
-import { FIELD_GROUPS, FIELD_TYPES_BY_GROUP, MAX_FIELDS_PER_FORM, type FieldTypeDef } from "./field-registry";
+import {
+  FIELD_GROUPS,
+  LIBRARY_BY_GROUP,
+  MAX_FIELDS_PER_FORM,
+  type LibraryEntry,
+} from "./field-registry";
 import { Search, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
@@ -24,7 +29,7 @@ export function FieldLibrary({
   disabled,
   fieldCount,
 }: {
-  onAdd: (type: FieldTypeDef["value"]) => void;
+  onAdd: (entry: LibraryEntry) => void;
   disabled: boolean;
   fieldCount: number;
 }) {
@@ -32,14 +37,14 @@ export function FieldLibrary({
   const q = query.trim().toLowerCase();
 
   const groups = useMemo(() => {
-    if (!q) return FIELD_GROUPS.map((g) => ({ ...g, items: FIELD_TYPES_BY_GROUP[g.key] }));
+    if (!q) return FIELD_GROUPS.map((g) => ({ ...g, items: LIBRARY_BY_GROUP[g.key] }));
     return FIELD_GROUPS.map((g) => ({
       ...g,
-      items: FIELD_TYPES_BY_GROUP[g.key].filter(
+      items: LIBRARY_BY_GROUP[g.key].filter(
         (t) =>
           t.label.toLowerCase().includes(q) ||
           t.description.toLowerCase().includes(q) ||
-          t.value.includes(q),
+          t.type.includes(q),
       ),
     })).filter((g) => g.items.length > 0);
   }, [q]);
@@ -80,10 +85,10 @@ export function FieldLibrary({
               {group.items.map((t) => {
                 const Icon = t.icon;
                 return (
-                  <li key={t.value}>
+                  <li key={t.key}>
                     <button
                       type="button"
-                      onClick={() => onAdd(t.value)}
+                      onClick={() => onAdd(t)}
                       disabled={disabled || atLimit}
                       className={cn(
                         "group flex w-full items-start gap-2.5 rounded-xl border-2 border-transparent bg-background p-2.5 text-left transition-all",

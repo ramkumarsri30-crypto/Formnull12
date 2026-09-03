@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Logo } from "@/components/formnull/logo";
 import { Button } from "@/components/ui/button";
 import {
@@ -41,6 +41,7 @@ import {
   Plus,
   Check,
   Building2,
+  PanelLeftOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -99,17 +100,32 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
   return (
     <div className="relative flex min-h-screen flex-col bg-background">
       {/* =============================================================== */}
-      {/* Desktop sidebar (lg+)                                            */}
+      {/* Desktop sidebar (lg+) — full on normal routes                   */}
       {/* =============================================================== */}
-      <aside
-        className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r-2 border-foreground/10 bg-sidebar lg:flex"
-        aria-label="Primary navigation"
-      >
-        <SidebarContent
+      {!isBuilderRoute && (
+        <aside
+          className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r-2 border-foreground/10 bg-sidebar lg:flex"
+          aria-label="Primary navigation"
+        >
+          <SidebarContent
+            pathname={pathname}
+            onSignOut={handleSignOut}
+          />
+        </aside>
+      )}
+
+      {/* =============================================================== */}
+      {/* Desktop builder rail (lg+) — compact icons, expands on hover    */}
+      {/* or via its keyboard-accessible expand button. The builder page  */}
+      {/* keeps its full width (pl-14); the expansion is an overlay that  */}
+      {/* never reflows builder content.                                  */}
+      {/* =============================================================== */}
+      {isBuilderRoute && (
+        <BuilderNavRail
           pathname={pathname}
           onSignOut={handleSignOut}
         />
-      </aside>
+      )}
 
       {/* =============================================================== */}
       {/* Mobile drawer                                                    */}
@@ -149,42 +165,58 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
       <div
         className={
           isBuilderRoute
-            ? "flex h-dvh flex-col overflow-hidden lg:pl-64"
+            ? "flex h-dvh flex-col overflow-hidden lg:pl-14"
             : "flex min-h-screen flex-col lg:pl-64"
         }
       >
-        {/* Top bar */}
-        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b-2 border-foreground/10 bg-background/85 px-4 backdrop-blur-md sm:px-6 lg:h-16">
-          {/* Hamburger (mobile only) */}
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            className="lg:hidden"
-            onClick={() => setMobileOpen(true)}
-            aria-label="Open menu"
-          >
-            <Menu className="h-5 w-5" />
-          </Button>
+        {/* Top bar — the builder route replaces the standard dashboard
+            header (page title + New form are dashboard-level items) with
+            a hamburger-only bar for mobile; desktop builder has its own
+            in-builder toolbar (see form-detail.tsx). */}
+        {isBuilderRoute ? (
+          <header className="sticky top-0 z-20 flex h-12 shrink-0 items-center gap-3 border-b-2 border-foreground/10 bg-background/85 px-3 backdrop-blur-md lg:hidden">
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setMobileOpen(true)}
+              aria-label="Open navigation menu"
+            >
+              <Menu className="h-5 w-5" />
+            </Button>
+          </header>
+        ) : (
+          <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b-2 border-foreground/10 bg-background/85 px-4 backdrop-blur-md sm:px-6 lg:h-16">
+            {/* Hamburger (mobile only) */}
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              className="lg:hidden"
+              onClick={() => setMobileOpen(true)}
+              aria-label="Open menu"
+            >
+              <Menu className="h-5 w-5" />
+            </Button>
 
-          <div className="flex-1">
-            <h2 className="font-display text-sm font-bold tracking-tight sm:text-base">
-              {getPageTitle(pathname)}
-            </h2>
-          </div>
+            <div className="flex-1">
+              <h2 className="font-display text-sm font-bold tracking-tight sm:text-base">
+                {getPageTitle(pathname)}
+              </h2>
+            </div>
 
-          {/* Quick action */}
-          <Button asChild variant="memphis-coral" size="sm" className="hidden sm:inline-flex">
-            <Link href="/dashboard/forms/new">
-              <Plus className="h-4 w-4" />
-              New form
-            </Link>
-          </Button>
-          <Button asChild variant="memphis-coral" size="icon-sm" className="sm:hidden" aria-label="New form">
-            <Link href="/dashboard/forms/new">
-              <Plus className="h-4 w-4" />
-            </Link>
-          </Button>
-        </header>
+            {/* Quick action */}
+            <Button asChild variant="memphis-coral" size="sm" className="hidden sm:inline-flex">
+              <Link href="/dashboard/forms/new">
+                <Plus className="h-4 w-4" />
+                New form
+              </Link>
+            </Button>
+            <Button asChild variant="memphis-coral" size="icon-sm" className="sm:hidden" aria-label="New form">
+              <Link href="/dashboard/forms/new">
+                <Plus className="h-4 w-4" />
+              </Link>
+            </Button>
+          </header>
+        )}
 
         {/* Page content */}
         {isBuilderRoute ? (
@@ -208,6 +240,176 @@ function getPageTitle(pathname: string): string {
   if (pathname.startsWith("/dashboard/settings")) return "Settings";
   if (pathname.startsWith("/dashboard/account")) return "Account";
   return "Dashboard";
+}
+
+/* ------------------------------------------------------------------ */
+/* Builder navigation rail (desktop lg+)                                */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The builder's compact navigation. A 56px icon rail stays permanently
+ * visible; hovering it (mouse) or pressing its expand button (keyboard /
+ * click) reveals the FULL navigation as an overlay panel that floats over
+ * the builder content — the builder itself never reflows or shifts
+ * (main keeps a constant lg:pl-14).
+ *
+ * Accessibility contract:
+ *   - Every rail icon is a real link/button with an aria-label — direct
+ *     keyboard navigation works while collapsed.
+ *   - The expand button carries aria-expanded + aria-controls; the panel
+ *     is NOT hover-only. Escape closes it and returns focus to the
+ *     expand button.
+ *   - While the panel is open the rail behind it is `inert`, so tab
+ *     order never lands on covered controls.
+ */
+function BuilderNavRail({
+  pathname,
+  onSignOut,
+}: {
+  pathname: string;
+  onSignOut: () => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  /** Focus should move INTO the panel (expand-button path), not hover. */
+  const [focusPanel, setFocusPanel] = useState(false);
+  const expandBtnRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
+
+  // Escape closes the panel and restores focus to the expand button.
+  useEffect(() => {
+    if (!expanded) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setExpanded(false);
+        setFocusPanel(false);
+        // Focus AFTER React commits the collapse — the rail leaves the
+        // inert state in that commit, and focusing an inert element is
+        // a no-op (focus would fall to <body>).
+        requestAnimationFrame(() => expandBtnRef.current?.focus());
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [expanded]);
+
+  // Move focus into the panel only when opened via the button (the
+  // keyboard path); hover expansion must never steal focus.
+  useEffect(() => {
+    if (expanded && focusPanel) {
+      const first = panelRef.current?.querySelector<HTMLElement>(
+        "a[href], button:not([disabled])",
+      );
+      first?.focus();
+    }
+  }, [expanded, focusPanel]);
+
+  function open(viaButton: boolean) {
+    setFocusPanel(viaButton);
+    setExpanded(true);
+  }
+
+  return (
+    <div
+      className="hidden lg:block"
+      onMouseEnter={() => open(false)}
+      onMouseLeave={() => {
+        setExpanded(false);
+        setFocusPanel(false);
+      }}
+    >
+      {/* Collapsed rail — permanent DOM, stable focus targets */}
+      <aside
+        inert={expanded}
+        aria-label="Builder navigation"
+        className="fixed inset-y-0 left-0 z-30 flex w-14 flex-col items-center gap-2 border-r-2 border-foreground/10 bg-sidebar px-1.5 py-3"
+      >
+        <Button
+          ref={expandBtnRef}
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Expand navigation"
+          aria-expanded={expanded}
+          aria-controls="builder-nav-panel"
+          onClick={() => open(true)}
+          className="shrink-0"
+        >
+          <PanelLeftOpen className="h-4.5 w-4.5" aria-hidden />
+        </Button>
+
+        <Link
+          href="/dashboard"
+          aria-label="FormNull home"
+          className="mt-1 flex shrink-0 items-center justify-center rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <Logo showWordmark={false} size={30} />
+        </Link>
+
+        <nav aria-label="Primary" className="mt-3 flex flex-col items-center gap-1.5">
+          {NAV.map((item) => {
+            const Icon = item.icon;
+            const active =
+              pathname === item.href ||
+              pathname === `${item.href}/` ||
+              (item.href !== "/dashboard" && pathname.startsWith(item.href));
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                aria-label={item.label}
+                aria-current={active ? "page" : undefined}
+                title={item.label}
+                className={cn(
+                  "flex h-9 w-9 items-center justify-center rounded-lg transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                  active
+                    ? "bg-primary text-primary-foreground"
+                    : "text-foreground/70 hover:bg-accent/10 hover:text-foreground",
+                )}
+              >
+                <Icon className="h-4 w-4" aria-hidden />
+              </Link>
+            );
+          })}
+        </nav>
+
+        <div className="mt-auto flex flex-col items-center gap-1.5">
+          <RailAccountButton onExpand={() => open(true)} />
+        </div>
+      </aside>
+
+      {/* Expanded overlay — the full navigation, floating over the builder */}
+      {expanded && (
+        <div
+          ref={panelRef}
+          id="builder-nav-panel"
+          className="fixed inset-y-0 left-0 z-40 flex w-64 flex-col border-r-2 border-foreground/10 bg-sidebar shadow-2xl"
+        >
+          <SidebarContent pathname={pathname} onSignOut={onSignOut} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Avatar button that opens the full panel (account + sign out live there). */
+function RailAccountButton({ onExpand }: { onExpand: () => void }) {
+  const { user } = useAuth();
+  const email = user?.email ?? "";
+  const initial = (email?.[0] ?? "?").toUpperCase();
+  return (
+    <button
+      type="button"
+      onClick={onExpand}
+      aria-label={`Account — ${email || "open navigation"}`}
+      className="relative flex h-9 w-9 items-center justify-center rounded-full bg-foreground text-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+    >
+      <span className="font-display text-sm font-bold">{initial}</span>
+      <GeometricCircle
+        color="mint"
+        size={10}
+        className="-bottom-0.5 -right-0.5"
+      />
+    </button>
+  );
 }
 
 /* ------------------------------------------------------------------ */

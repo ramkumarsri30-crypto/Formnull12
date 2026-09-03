@@ -178,10 +178,8 @@ export function FieldPropertyEditor({
     // Option invariants first (better message than the generic check).
     if (def.value === "single_select" || def.value === "multi_select") {
       const rows = configToRows(draft.config);
-      const optCheck = validateOptions(
-        rowsToConfig(rows).options,
-        rowsToConfig(rows).optionLabels,
-      );
+      const { values, labels } = rowsToConfig(rows);
+      const optCheck = validateOptions(values, labels);
       if (!optCheck.ok) {
         setOptionError(optCheck.message ?? "Invalid options.");
         setValidationError(optCheck.message ?? "Invalid options.");
@@ -251,7 +249,19 @@ export function FieldPropertyEditor({
           <def.icon className="h-4 w-4" />
         </span>
         <div className="min-w-0">
-          <p className="text-sm font-bold text-foreground">{def.label}</p>
+          <p className="text-sm font-bold text-foreground">
+            {def.label}
+            {def.value === "multi_select" && draft.config.ranked === true && (
+              <span className="ml-1.5 rounded-md bg-[color:var(--memphis-coral)]/12 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[color:var(--memphis-coral)]">
+                Ranking
+              </span>
+            )}
+            {def.value === "scale" && draft.config.style === "slider" && (
+              <span className="ml-1.5 rounded-md bg-[color:var(--memphis-coral)]/12 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[color:var(--memphis-coral)]">
+                Slider
+              </span>
+            )}
+          </p>
           <p className="truncate font-mono text-[11px] text-muted-foreground" title={field.field_key}>
             {field.field_key}
           </p>
@@ -468,11 +478,68 @@ function PropertyControlShell({
         </div>
       );
 
+    case "date":
+      return (
+        <div className={wrapperClass}>
+          <ControlLabel prop={prop} htmlFor={cid} />
+          <Input
+            id={cid}
+            type="date"
+            value={configStr(draft.config[prop.key])}
+            onChange={(e) => onConfigValue(e.target.value || null)}
+            disabled={saving}
+            className="h-9"
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "datetime":
+      return (
+        <div className={wrapperClass}>
+          <ControlLabel prop={prop} htmlFor={cid} />
+          <Input
+            id={cid}
+            type="datetime-local"
+            value={configStr(draft.config[prop.key])}
+            onChange={(e) => onConfigValue(e.target.value || null)}
+            disabled={saving}
+            className="h-9"
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "config-switch": {
+      const current =
+        typeof draft.config[prop.key] === "boolean"
+          ? (draft.config[prop.key] as boolean)
+          : (prop.defaultOn ?? false);
+      return (
+        <div
+          className={cn(
+            "flex items-center justify-between gap-3 rounded-xl border border-foreground/10 bg-background p-3",
+            prop.fullWidth && "col-span-2",
+          )}
+        >
+          {asPlain({ prop })}
+          <Switch
+            checked={current}
+            onCheckedChange={(v) => onConfigValue(v)}
+            disabled={saving}
+            aria-label={prop.label}
+          />
+        </div>
+      );
+    }
+
     case "options-editor":
       return (
         <div className={cn(wrapperClass, "col-span-2")}>
           <OptionsControl
             config={draft.config}
+            propKey={prop.key}
+            optionKeys={prop.optionKeys}
             onConfigPatch={onConfigPatch}
             saving={saving}
             error={optionError}
@@ -502,27 +569,35 @@ function PropertyControlShell({
 /*
  * Options control container — keeps option rows in LOCAL state (so
  * per-row flags like valueEdited survive keystrokes) while writing
- * every change back into the draft config immediately. Remounts with
- * the property editor on field switches, re-deriving rows from the
- * saved config.
+ * every change back into the draft config immediately. Parameterized
+ * by the property's optionKeys so matrix rows/columns reuse the exact
+ * same editor. Remounts with the property editor on field switches,
+ * re-deriving rows from the saved config.
  */
 function OptionsControl({
   config,
+  propKey,
+  optionKeys,
   onConfigPatch,
   saving,
   error,
 }: {
   config: Record<string, unknown>;
+  /** Property key — used to pick the item noun (matrix rows/columns). */
+  propKey: string;
+  optionKeys?: { values: string; labels: string };
   onConfigPatch: (p: Record<string, unknown>) => void;
   saving: boolean;
   error: string | null;
 }) {
-  const [rows, setRows] = useState<OptionRow[]>(() => configToRows(config));
+  const keys = optionKeys ?? { values: "options", labels: "optionLabels" };
+  const [rows, setRows] = useState<OptionRow[]>(() => configToRows(config, keys));
+  const itemNoun = propKey === "rows" ? "row" : propKey === "columns" ? "column" : "option";
 
   function update(next: OptionRow[]) {
     setRows(next);
-    const { options, optionLabels } = rowsToConfig(next);
-    onConfigPatch({ options, optionLabels });
+    const { values, labels } = rowsToConfig(next, keys);
+    onConfigPatch({ [keys.values]: values, [keys.labels]: labels });
   }
 
   return (
@@ -531,6 +606,7 @@ function OptionsControl({
       onChange={update}
       disabled={saving}
       errors={error}
+      itemNoun={itemNoun}
     />
   );
 }
@@ -645,18 +721,24 @@ function DefaultCountryControl({
 
 /**
  * Remove declared keys the user emptied; preserve everything else.
- * `options`/`optionLabels` keep their working shapes (validated).
+ * Option-like pairs (options/optionLabels, rows/rowLabels,
+ * columns/columnLabels) keep their working shapes (validated).
  */
 function cleanConfig(
   def: FieldTypeDef,
   config: Record<string, unknown>,
 ): Record<string, unknown> {
+  // Every option pair any property of this type declares.
+  const optionPairs = def.properties
+    .filter((p) => p.control === "options-editor")
+    .map((p) => p.optionKeys ?? { values: "options", labels: "optionLabels" });
+  const pairValues = new Set(optionPairs.flatMap((k) => [k.values, k.labels]));
   const declared = new Set(
     def.properties.filter((p) => p.target === "config").map((p) => p.key),
   );
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(config)) {
-    if (k === "options" || k === "optionLabels") {
+    if (pairValues.has(k)) {
       // Handled wholesale below.
       continue;
     }
@@ -668,12 +750,12 @@ function cleanConfig(
     if (typeof v === "string" && v.trim() === "") continue;
     out[k] = v;
   }
-  if (declared.has("options")) {
-    const rows = configToRows(config);
-    const { options, optionLabels } = rowsToConfig(rows);
-    if (options.length > 0) {
-      out.options = options;
-      if (Object.keys(optionLabels).length > 0) out.optionLabels = optionLabels;
+  for (const keys of optionPairs) {
+    const rows = configToRows(config, keys);
+    const { values, labels } = rowsToConfig(rows, keys);
+    if (values.length > 0) {
+      out[keys.values] = values;
+      if (Object.keys(labels).length > 0) out[keys.labels] = labels;
     }
   }
   return out;

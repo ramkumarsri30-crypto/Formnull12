@@ -33,7 +33,7 @@
  * documents it as client-enforced because PostgreSQL cannot evaluate
  * JS regex semantics.
  */
-import { useState, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -50,6 +50,7 @@ import { Star, Heart, ThumbsUp, Circle, Upload, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Database, FieldType } from "@/lib/supabase/types";
 import { PhoneControl } from "./phone-control";
+import { COUNTRIES, countryByIso } from "./country-data";
 
 /* ------------------------------------------------------------------ */
 /* Option labels (Field System 2.0) — config.optionLabels maps a      */
@@ -64,7 +65,16 @@ export function optionLabelFor(
   config: Record<string, unknown>,
   value: string,
 ): string {
-  const labels = config.optionLabels;
+  return labelForPair(config, "optionLabels", value);
+}
+
+/** Display label for a stable value from a {value→label} config map. */
+export function labelForPair(
+  config: Record<string, unknown>,
+  labelsKey: string,
+  value: string,
+): string {
+  const labels = config[labelsKey];
   if (labels && typeof labels === "object" && !Array.isArray(labels)) {
     const l = (labels as Record<string, unknown>)[value];
     if (typeof l === "string" && l.trim() !== "") return l;
@@ -321,6 +331,34 @@ export function validateFieldValue(
       if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return "Use the YYYY-MM-DD date format.";
       const d = new Date(`${value}T00:00:00Z`);
       if (Number.isNaN(d.getTime())) return "Enter a real calendar date.";
+      // Range bounds — client-declared (006 checks the format + realness
+      // server-side; range rules are a builder-side contract).
+      const minDate = typeof config.minDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(config.minDate) ? config.minDate : null;
+      const maxDate = typeof config.maxDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(config.maxDate) ? config.maxDate : null;
+      if (minDate && value < minDate) return `Answer must be on or after ${minDate}.`;
+      if (maxDate && value > maxDate) return `Answer must be on or before ${maxDate}.`;
+      return null;
+    }
+
+    case "datetime": {
+      if (typeof value !== "string") return "Answer must be a date and time.";
+      if (isBlank(value)) return req ? "This field is required." : null;
+      // datetime-local writes "YYYY-MM-DDTHH:MM" — normalized to a space
+      // for storage so Postgres can cast it directly.
+      const v = value.replace("T", " ");
+      if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(v)) {
+        return "Use the YYYY-MM-DD HH:MM format.";
+      }
+      // ISO-string parsing rejects impossible dates (Feb 30 → NaN),
+      // mirroring Postgres's strict ::timestamp cast.
+      if (Number.isNaN(new Date(`${v.replace(" ", "T")}:00`).getTime())) {
+        return "Enter a real date and time.";
+      }
+      const min = typeof config.minDate === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(config.minDate) ? config.minDate : null;
+      const max = typeof config.maxDate === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(config.maxDate) ? config.maxDate : null;
+      const local = v.replace(" ", "T");
+      if (min && local < min) return `Answer must be at or after ${min.replace("T", " ")}.`;
+      if (max && local > max) return `Answer must be at or before ${max.replace("T", " ")}.`;
       return null;
     }
 
@@ -352,6 +390,59 @@ export function validateFieldValue(
         }
         if (seen.has(v)) return "Do not select the same option twice.";
         seen.add(v);
+      }
+      // Ranked multi-select: every option must be placed (client-side
+      // ordering contract — the server validates membership + dupes).
+      if (config.ranked === true && options.every((o) => typeof o === "string")) {
+        const optStrings = options as string[];
+        if (value.length !== optStrings.length) {
+          return "Rank every option to continue.";
+        }
+      }
+      return null;
+    }
+
+    case "matrix": {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "Pick one column for each row.";
+      }
+      const rows = Array.isArray(config.rows) ? (config.rows as unknown[]).filter((r): r is string => typeof r === "string") : [];
+      const columns = Array.isArray(config.columns) ? (config.columns as unknown[]).filter((c): c is string => typeof c === "string") : [];
+      const answer = value as Record<string, unknown>;
+      const answered = Object.keys(answer).filter((k) => answer[k] !== undefined && answer[k] !== null && answer[k] !== "");
+      if (answered.length === 0) return req ? "This field is required." : null;
+      for (const k of answered) {
+        if (!rows.includes(k)) return "One of the rows is no longer offered.";
+        if (typeof answer[k] !== "string" || !columns.includes(answer[k] as string)) {
+          return "Pick one of the offered columns.";
+        }
+      }
+      if (req) {
+        const missing = rows.filter((r) => !answered.includes(r));
+        if (missing.length > 0) return "Answer every row to continue.";
+      }
+      return null;
+    }
+
+    case "address": {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "Answer must be an address.";
+      }
+      const answer = value as Record<string, unknown>;
+      const part = (k: string): string =>
+        typeof answer[k] === "string" ? (answer[k] as string) : "";
+      const filled = Object.keys(answer).some((k) => part(k).trim() !== "");
+      if (!filled) return req ? "This field is required." : null;
+      if (req) {
+        if (!part("line1").trim() || !part("city").trim() || !part("country").trim()) {
+          return "A required address needs the street, city and country.";
+        }
+      }
+      const caps: Record<string, number> = { line1: 200, line2: 200, city: 200, state: 200, postal_code: 20, country: 60 };
+      for (const [k, cap] of Object.entries(caps)) {
+        if (part(k).length > cap) {
+          return `The ${k.replace("_", " ")} part is too long (at most ${cap} characters).`;
+        }
       }
       return null;
     }
@@ -525,8 +616,27 @@ export function FieldControl({
           value={typeof value === "string" ? value : ""}
           onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
           disabled={disabled}
+          min={typeof cfg.minDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfg.minDate) ? cfg.minDate : undefined}
+          max={typeof cfg.maxDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(cfg.maxDate) ? cfg.maxDate : undefined}
         />
       );
+
+    case "datetime": {
+      // Storage form is "YYYY-MM-DD HH:MM" (007's contract); the input
+      // works in "YYYY-MM-DDTHH:MM" and the conversion is symmetric.
+      const stored = typeof value === "string" ? value.replace(" ", "T") : "";
+      return (
+        <Input
+          id={id}
+          type="datetime-local"
+          value={/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(stored) ? stored : ""}
+          onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value.replace("T", " "))}
+          disabled={disabled}
+          min={typeof cfg.minDate === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cfg.minDate) ? cfg.minDate : undefined}
+          max={typeof cfg.maxDate === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(cfg.maxDate) ? cfg.maxDate : undefined}
+        />
+      );
+    }
 
     case "time":
       return (
@@ -566,6 +676,17 @@ export function FieldControl({
 
     case "multi_select": {
       const options = Array.isArray(cfg.options) ? (cfg.options as unknown[]).filter((o) => typeof o === "string") : [];
+      if (cfg.ranked === true) {
+        return (
+          <RankedControl
+            field={field}
+            options={options as string[]}
+            value={value}
+            onChange={onChange}
+            disabled={disabled}
+          />
+        );
+      }
       const selected = Array.isArray(value) ? (value as unknown[]).filter((v) => typeof v === "string") : [];
       return (
         <div className="space-y-2" role="group" aria-label={field.label}>
@@ -648,9 +769,12 @@ export function FieldControl({
       for (let v = min; v <= max + 1e-9; v += step) steps.push(Number(v.toFixed(6)));
       const current = typeof value === "number" ? value : undefined;
 
-      // Compact segmented control for small step counts; a slider for
-      // large ones (keeps wide scales usable on phones).
-      if (steps.length <= 12) {
+      // Presentation style: config.style forces buttons or a slider;
+      // unset ("Auto") picks buttons for short scales and a slider for
+      // long ones. Same answer shape either way.
+      const style = cfg.style === "buttons" || cfg.style === "slider" ? cfg.style : steps.length > 12 ? "slider" : "buttons";
+
+      if (style === "buttons") {
         return (
           <div className="space-y-1.5">
             <div className="flex flex-wrap gap-1.5" role="group" aria-label={field.label}>
@@ -705,6 +829,29 @@ export function FieldControl({
       );
     }
 
+    case "matrix":
+      return (
+        <MatrixControl
+          field={field}
+          cfg={cfg}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+        />
+      );
+
+    case "address":
+      return (
+        <AddressControl
+          id={id}
+          field={field}
+          cfg={cfg}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+        />
+      );
+
     case "file_upload": {
       const types = Array.isArray(cfg.allowedTypes) ? (cfg.allowedTypes as string[]).join(", ") : null;
       const maxSize = typeof cfg.maxSizeMb === "number" ? cfg.maxSizeMb : null;
@@ -727,6 +874,382 @@ export function FieldControl({
     default:
       return null;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* RankedControl — multi_select with ranked=true                       */
+/*                                                                      */
+/* The answer is an ORDERED string[] (the rank). Clicking an option    */
+/* appends it at the next position; up/down reorders; clicking a       */
+/* ranked item removes it. Every control is a real button (keyboard    */
+/* accessible); the server-side contract is the same multi_select      */
+/* validation (membership + no duplicates) with order preserved in     */
+/* storage.                                                            */
+/* ------------------------------------------------------------------ */
+
+function RankedControl({
+  field,
+  options,
+  value,
+  onChange,
+  disabled,
+}: {
+  field: RenderableFormField;
+  options: string[];
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const cfg = field.config ?? {};
+  const ranked = Array.isArray(value)
+    ? (value as unknown[]).filter((v): v is string => typeof v === "string")
+    : [];
+  const unranked = options.filter((o) => !ranked.includes(o));
+
+  function add(opt: string) {
+    if (disabled) return;
+    onChange([...ranked, opt]);
+  }
+
+  function remove(opt: string) {
+    if (disabled) return;
+    const next = ranked.filter((r) => r !== opt);
+    onChange(next.length === 0 ? undefined : next);
+  }
+
+  function move(i: number, dir: -1 | 1) {
+    if (disabled) return;
+    const j = i + dir;
+    if (j < 0 || j >= ranked.length) return;
+    const next = [...ranked];
+    const [row] = next.splice(i, 1);
+    next.splice(j, 0, row);
+    onChange(next);
+  }
+
+  const labelFor = (opt: string) => optionLabelFor(cfg, opt);
+
+  return (
+    <div className="space-y-3" role="group" aria-label={field.label}>
+      {ranked.length > 0 && (
+        <ul className="space-y-1.5">
+          {ranked.map((opt, i) => (
+            <li
+              key={opt}
+              className="flex items-center gap-2 rounded-lg border-2 border-foreground/15 bg-background px-3 py-2"
+            >
+              <span
+                className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-foreground text-[11px] font-bold text-background"
+                aria-hidden
+              >
+                {i + 1}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-sm">{labelFor(opt)}</span>
+              <span className="flex shrink-0 items-center gap-0.5" role="group" aria-label={`Reorder ${labelFor(opt)}`}>
+                <button
+                  type="button"
+                  onClick={() => move(i, -1)}
+                  disabled={disabled || i === 0}
+                  aria-label={`Move ${labelFor(opt)} up in ranking`}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+                >
+                  <span aria-hidden>↑</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => move(i, 1)}
+                  disabled={disabled || i === ranked.length - 1}
+                  aria-label={`Move ${labelFor(opt)} down in ranking`}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+                >
+                  <span aria-hidden>↓</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => remove(opt)}
+                  disabled={disabled}
+                  aria-label={`Remove ${labelFor(opt)} from ranking`}
+                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground/70 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <span aria-hidden>✕</span>
+                </button>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {unranked.length > 0 && (
+        <div>
+          <p className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/80">
+            {ranked.length === 0 ? "Pick in order of preference" : "Still unranked"}
+          </p>
+          <ul className="space-y-1.5">
+            {unranked.map((opt) => (
+              <li key={opt}>
+                <button
+                  type="button"
+                  onClick={() => add(opt)}
+                  disabled={disabled}
+                  aria-label={`Rank ${labelFor(opt)} ${ranked.length + 1}${ranked.length === 0 ? "st" : ranked.length === 1 ? "nd" : ranked.length === 2 ? "rd" : "th"}`}
+                  className="flex w-full items-center gap-2 rounded-lg border border-foreground/10 bg-background px-3 py-2 text-left text-sm transition-colors hover:border-foreground/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <span
+                    className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md border-2 border-dashed border-foreground/25 text-[11px] font-bold text-muted-foreground"
+                    aria-hidden
+                  >
+                    +
+                  </span>
+                  <span className="min-w-0 flex-1 truncate">{labelFor(opt)}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* MatrixControl — rows × columns, one column picked per row           */
+/*                                                                      */
+/* The answer is a { rowValue: columnValue } record. Each row is an    */
+/* accessible radiogroup (fieldset + legend) of the column choices.    */
+/* ------------------------------------------------------------------ */
+
+function MatrixControl({
+  field,
+  cfg,
+  value,
+  onChange,
+  disabled,
+}: {
+  field: RenderableFormField;
+  cfg: Record<string, unknown>;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const rows = Array.isArray(cfg.rows) ? (cfg.rows as unknown[]).filter((r): r is string => typeof r === "string") : [];
+  const columns = Array.isArray(cfg.columns) ? (cfg.columns as unknown[]).filter((c): c is string => typeof c === "string") : [];
+  const rawLabels = cfg.rowLabels;
+  const rowLabels =
+    rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)
+      ? (rawLabels as Record<string, string>)
+      : {};
+  const answer =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, string>)
+      : {};
+
+  function pick(row: string, column: string | undefined) {
+    if (disabled) return;
+    const next: Record<string, string> = { ...answer };
+    if (column === undefined) delete next[row];
+    else next[row] = column;
+    onChange(Object.keys(next).length === 0 ? undefined : next);
+  }
+
+  const rowLabel = (r: string) =>
+    typeof rowLabels[r] === "string" && rowLabels[r].trim() !== "" ? rowLabels[r] : r;
+
+  return (
+    <div className="space-y-3 overflow-x-auto" role="group" aria-label={field.label}>
+      {rows.map((row) => (
+        <fieldset key={row} className="min-w-0" disabled={disabled}>
+          <legend className="mb-1.5 text-sm font-semibold text-foreground">
+            {rowLabel(row)}
+          </legend>
+          <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label={rowLabel(row)}>
+            {columns.map((col) => {
+              const selected = answer[row] === col;
+              return (
+                <label
+                  key={col}
+                  className={cn(
+                    "flex cursor-pointer items-center gap-1.5 rounded-lg border-2 px-3 py-1.5 text-sm transition-colors",
+                    selected
+                      ? "border-foreground bg-foreground text-background"
+                      : "border-foreground/15 bg-background text-foreground/80 hover:border-foreground/40",
+                    disabled && "cursor-not-allowed opacity-60",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name={`${field.field_key}-${row}`}
+                    checked={selected}
+                    onChange={() => pick(row, col)}
+                    disabled={disabled}
+                    className="sr-only"
+                  />
+                  <span
+                    className={cn(
+                      "h-2.5 w-2.5 shrink-0 rounded-full border-2",
+                      selected ? "border-background" : "border-foreground/40",
+                    )}
+                    aria-hidden
+                  />
+                  {labelForPair(cfg, "columnLabels", col)}
+                </label>
+              );
+            })}
+          </div>
+        </fieldset>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* AddressControl — structured street / city / postal / country        */
+/*                                                                      */
+/* The answer is a { part: text } record. Country uses the ISO-code    */
+/* selector (same country data as PhoneControl). Line 1 and city are   */
+/* always shown; line 2 / state / postal / country follow config.      */
+/* ------------------------------------------------------------------ */
+
+function AddressControl({
+  id,
+  field,
+  cfg,
+  value,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  field: RenderableFormField;
+  cfg: Record<string, unknown>;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const answer =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+  const part = (k: string): string => (typeof answer[k] === "string" ? (answer[k] as string) : "");
+  const show = (k: string, def: boolean): boolean =>
+    typeof cfg[k] === "boolean" ? (cfg[k] as boolean) : def;
+
+  function setPart(k: string, v: string) {
+    if (disabled) return;
+    const next: Record<string, string> = {};
+    for (const key of ["line1", "line2", "city", "state", "postal_code", "country"]) {
+      const current = part(key);
+      if (current.trim() !== "") next[key] = current;
+    }
+    if (v.trim() !== "") next[k] = v;
+    else delete next[k];
+    onChange(Object.keys(next).length === 0 ? undefined : next);
+  }
+
+  const countryValue = part("country");
+  const countryName = countryByIso(countryValue)?.name ?? "";
+
+  return (
+    <div className="space-y-2.5">
+      <div className="space-y-1.5">
+        <Label htmlFor={`${id}-line1`} className="text-xs">
+          Address line 1
+        </Label>
+        <Input
+          id={`${id}-line1`}
+          value={part("line1")}
+          onChange={(e) => setPart("line1", e.target.value)}
+          disabled={disabled}
+          maxLength={200}
+          placeholder="123 Main Street"
+          autoComplete="address-line1"
+        />
+      </div>
+      {show("showLine2", false) && (
+        <div className="space-y-1.5">
+          <Label htmlFor={`${id}-line2`} className="text-xs">
+            Address line 2 <span className="text-muted-foreground">(optional)</span>
+          </Label>
+          <Input
+            id={`${id}-line2`}
+            value={part("line2")}
+            onChange={(e) => setPart("line2", e.target.value)}
+            disabled={disabled}
+            maxLength={200}
+            placeholder="Apartment, suite…"
+            autoComplete="address-line2"
+          />
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        <div className="space-y-1.5">
+          <Label htmlFor={`${id}-city`} className="text-xs">
+            City
+          </Label>
+          <Input
+            id={`${id}-city`}
+            value={part("city")}
+            onChange={(e) => setPart("city", e.target.value)}
+            disabled={disabled}
+            maxLength={200}
+            autoComplete="address-level2"
+          />
+        </div>
+        {show("showState", true) && (
+          <div className="space-y-1.5">
+            <Label htmlFor={`${id}-state`} className="text-xs">
+              State / region
+            </Label>
+            <Input
+              id={`${id}-state`}
+              value={part("state")}
+              onChange={(e) => setPart("state", e.target.value)}
+              disabled={disabled}
+              maxLength={200}
+              autoComplete="address-level1"
+            />
+          </div>
+        )}
+        {show("showPostal", true) && (
+          <div className="space-y-1.5">
+            <Label htmlFor={`${id}-postal`} className="text-xs">
+              Postal code
+            </Label>
+            <Input
+              id={`${id}-postal`}
+              value={part("postal_code")}
+              onChange={(e) => setPart("postal_code", e.target.value)}
+              disabled={disabled}
+              maxLength={20}
+              autoComplete="postal-code"
+            />
+          </div>
+        )}
+        {show("showCountry", true) && (
+          <div className="space-y-1.5">
+            <Label htmlFor={id} className="text-xs">
+              Country
+            </Label>
+            <Select
+              value={countryByIso(countryValue) ? countryValue : undefined}
+              onValueChange={(v) => setPart("country", v)}
+              disabled={disabled}
+            >
+              <SelectTrigger id={id} aria-required={field.is_required}>
+                <SelectValue placeholder="Choose a country" />
+              </SelectTrigger>
+              <SelectContent className="max-h-72">
+                {COUNTRIES.map((c) => (
+                  <SelectItem key={c.iso} value={c.iso}>
+                    {c.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {countryName && <p className="sr-only">Selected country: {countryName}</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -827,6 +1350,16 @@ export function FieldRenderer({
 
 /* ------------------------------------------------------------------ */
 /* FormRenderer — the whole form                                       */
+/*                                                                      */
+/* Two PRESENTATION modes share this one renderer, the same field      */
+/* definitions, the same validation and the same value model:          */
+/*                                                                      */
+/*   standard (default) — every field on a single scrolling page       */
+/*   card (settings.mode === "card") — one question at a time with     */
+/*                          Next/Back, a progress bar and per-step     */
+/*                          validation. Only the chrome differs; the   */
+/*                          FieldControl, FieldLabelBlock and          */
+/*                          validateFieldValue are identical.          */
 /* ------------------------------------------------------------------ */
 
 export function FormRenderer({
@@ -857,6 +1390,16 @@ export function FormRenderer({
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [showErrors, setShowErrors] = useState(false);
 
+  // Card presentation: respondent-facing only (the builder canvas is the
+  // editing surface and always shows the standard list).
+  const isCard = mode !== "builder" && form.settings?.mode === "card";
+  /** 0 = welcome card, 1..N = field cards (sorted order). */
+  const [step, setStep] = useState(0);
+
+  const sorted = useMemo(() => [...fields].sort((a, b) => a.sort_order - b.sort_order), [fields]);
+  const total = sorted.length;
+  const currentField = step >= 1 && step <= total ? sorted[step - 1] : null;
+
   const submitLabel =
     typeof form.settings?.submit_button_label === "string" && form.settings.submit_button_label.trim()
       ? form.settings.submit_button_label.trim().slice(0, 40)
@@ -886,6 +1429,28 @@ export function FormRenderer({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (mode === "builder" || !onSubmit) return;
+
+    // Card mode: advance one step at a time, validating only the field
+    // the respondent is leaving. The final step runs the full submit.
+    if (isCard) {
+      if (step < total) {
+        const f = sorted[step - 1];
+        if (f) {
+          const err = validateFieldValue(f, values[f.field_key]);
+          setErrors(err ? { [f.field_key]: err } : {});
+          setShowErrors(true);
+          if (err) {
+            const el = document.getElementById(`${idPrefix}fld-${f.field_key}`);
+            el?.focus?.();
+            return;
+          }
+        }
+        setStep(step + 1);
+        return;
+      }
+      // step === total → fall through to the real submit below.
+    }
+
     const errs = validateAllValues(fields, values);
     setShowErrors(true);
     setErrors(errs);
@@ -894,14 +1459,131 @@ export function FormRenderer({
       // Focus the first failing field for keyboard/screen-reader users.
       const el = document.getElementById(`${idPrefix}fld-${errorKeys[0]}`);
       el?.focus?.();
+      if (isCard) {
+        // Jump back to the first card that has a problem.
+        const idx = sorted.findIndex((f) => f.field_key === errorKeys[0]);
+        if (idx >= 0) setStep(idx + 1);
+      }
       return;
     }
     await onSubmit(values);
   }
 
-  const sorted = [...fields].sort((a, b) => a.sort_order - b.sort_order);
   const errorCount = Object.keys(errors).length;
 
+  /* ---------------- Card presentation ---------------- */
+  if (isCard) {
+    const pct = total > 0 ? Math.round((step / total) * 100) : 100;
+    const onLast = step >= total;
+    return (
+      <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
+        {step === 0 ? (
+          /* Welcome card — form title, description, Start */
+          <div className="flex min-h-[16rem] flex-col justify-center">
+            <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
+              {form.name}
+            </h2>
+            {form.description && (
+              <p className="mt-2 text-sm leading-relaxed text-muted-foreground sm:text-base">
+                {form.description}
+              </p>
+            )}
+            <div className="mt-8">
+              {total === 0 && onSubmit ? (
+                <Button type="submit" variant="memphis-coral" size="lg" disabled={submitting}>
+                  {submitting ? "Submitting…" : submitLabel}
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  variant="memphis-coral"
+                  size="lg"
+                  onClick={() => setStep(1)}
+                  autoFocus
+                >
+                  Start
+                </Button>
+              )}
+              {total === 0 && submitNotice}
+            </div>
+          </div>
+        ) : (
+          <div className="flex min-h-[16rem] flex-col">
+            {/* Progress */}
+            <div className="mb-6">
+              <div className="mb-1.5 flex items-center justify-between text-xs text-muted-foreground">
+                <span aria-live="polite">
+                  {step} / {total}
+                </span>
+                {onLast && <span>Final step</span>}
+              </div>
+              <div
+                role="progressbar"
+                aria-valuemin={0}
+                aria-valuemax={total}
+                aria-valuenow={step}
+                aria-label={`Question ${step} of ${total}`}
+                className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10"
+              >
+                <div
+                  className="h-full rounded-full bg-[color:var(--memphis-coral)] transition-all duration-300"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+            </div>
+
+            {/* The one field (sections render as statement cards) */}
+            {currentField && (
+              <div key={currentField.field_key} className="flex-1">
+                <FieldRenderer
+                  field={currentField}
+                  value={values[currentField.field_key]}
+                  error={showErrors ? errors[currentField.field_key] : undefined}
+                  onChange={(v) => setValue(currentField.field_key, v)}
+                  mode={mode}
+                  idPrefix={idPrefix}
+                />
+              </div>
+            )}
+
+            {/* Navigation */}
+            <div className="mt-8 flex flex-wrap items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                onClick={() => setStep((s) => Math.max(0, s - 1))}
+                disabled={submitting}
+              >
+                Back
+              </Button>
+              <Button type="submit" variant="memphis-coral" size="lg" disabled={submitting}>
+                {submitting
+                  ? "Submitting…"
+                  : onLast
+                    ? submitLabel
+                    : currentField?.field_type === "section"
+                      ? "Continue"
+                      : "Next"}
+              </Button>
+            </div>
+
+            {children}
+            {onLast && submitNotice && (
+              <div className="mt-3">{submitNotice}</div>
+            )}
+            {onLast && showErrors && errorCount > 0 && (
+              <p className="mt-3 text-sm font-medium text-destructive" role="alert">
+                {errorCount} answer{errorCount === 1 ? "" : "s"} need{errorCount === 1 ? "s" : ""} attention.
+              </p>
+            )}
+          </div>
+        )}
+      </form>
+    );
+  }
+
+  /* ---------------- Standard presentation ---------------- */
   return (
     <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
       {/* Form header — what respondents see */}

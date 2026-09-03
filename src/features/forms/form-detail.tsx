@@ -116,13 +116,14 @@ import {
 import { cn } from "@/lib/utils";
 import {
   fieldDef,
-  fieldLabel,
-  defaultConfigForType,
+  fieldDefSafe,
+  libraryLabelFor,
   MAX_FIELDS_PER_FORM,
   FIELD_LIMIT_WARN_AT,
   FIELD_GROUPS,
-  FIELD_TYPES_BY_GROUP,
-  type FieldType,
+  LIBRARY_BY_GROUP,
+  LIBRARY_ENTRIES,
+  type LibraryEntry,
 } from "./field-registry";
 import { FieldPropertyEditor, type FieldDraft } from "./field-property-editor";
 import { FieldLibrary } from "./field-library";
@@ -179,8 +180,10 @@ function statusColor(status: string): string {
 
 const PIN_PREF_KEY = "formnull.builder.libraryPinned";
 
-/** Quick-start field types offered in the empty canvas. */
-const QUICK_START: FieldType[] = ["short_text", "email", "single_select", "rating"];
+/** Quick-start library entries offered in the empty canvas. */
+const QUICK_START_ENTRIES: LibraryEntry[] = LIBRARY_ENTRIES.filter((e) =>
+  ["short_text", "email", "single_select", "nps"].includes(e.key),
+);
 
 /* ------------------------------------------------------------------ */
 /* FormDetail (builder)                                                */
@@ -200,6 +203,9 @@ export function FormDetail({ formId }: { formId: string }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [submitLabel, setSubmitLabel] = useState("");
+  /** Presentation mode — "card" shows one question at a time (preview +
+   *  public). Stored in forms.settings, snapshotted by publish_form. */
+  const [formMode, setFormMode] = useState<"standard" | "card">("standard");
   const [savingForm, setSavingForm] = useState(false);
   const [deletingForm, setDeletingForm] = useState(false);
 
@@ -207,7 +213,7 @@ export function FormDetail({ formId }: { formId: string }) {
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
   const [editorDirty, setEditorDirty] = useState(false);
   const [savingFieldId, setSavingFieldId] = useState<string | null>(null);
-  const [addingField, setAddingField] = useState<FieldType | null>(null);
+  const [addingField, setAddingField] = useState<LibraryEntry["type"] | null>(null);
   const [duplicatingFieldId, setDuplicatingFieldId] = useState<string | null>(null);
   const [reorderError, setReorderError] = useState<string | null>(null);
 
@@ -222,7 +228,8 @@ export function FormDetail({ formId }: { formId: string }) {
   const [deleteFieldTarget, setDeleteFieldTarget] = useState<FormField | null>(null);
   const [deleteFieldBusy, setDeleteFieldBusy] = useState(false);
   const [discardOpen, setDiscardOpen] = useState(false);
-  const [pendingSelection, setPendingSelection] = useState<string | null | "cancel">(null);
+  /** null | field-id | "cancel" | "navigate" (leaving the builder). */
+  const [pendingSelection, setPendingSelection] = useState<string | null | "cancel" | "navigate">(null);
   const [librarySheetOpen, setLibrarySheetOpen] = useState(false);
   const [propsSheetOpen, setPropsSheetOpen] = useState(false);
 
@@ -256,12 +263,25 @@ export function FormDetail({ formId }: { formId: string }) {
     typeof form?.settings?.submit_button_label === "string"
       ? (form.settings.submit_button_label as string)
       : "";
+  const savedMode: "standard" | "card" =
+    form?.settings?.mode === "card" ? "card" : "standard";
   const formDetailsDirty =
     form !== null &&
     (name !== form.name ||
       (description || "") !== (form.description ?? "") ||
-      submitLabel !== savedSubmitLabel);
+      submitLabel !== savedSubmitLabel ||
+      formMode !== savedMode);
   const hasFileUpload = fields.some((f) => f.field_type === "file_upload");
+  /** Field types present in this form that cannot be published yet
+   *  (file upload + staged types waiting for migration 007). */
+  const blockedTypes = useMemo(() => {
+    const labels = new Set<string>();
+    for (const f of fields) {
+      const def = fieldDefSafe(f.field_type);
+      if (def && !def.publishable) labels.add(def.label);
+    }
+    return [...labels];
+  }, [fields]);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -291,6 +311,7 @@ export function FormDetail({ formId }: { formId: string }) {
           ? (formRes.data.settings.submit_button_label as string)
           : "",
       );
+      setFormMode(formRes.data.settings?.mode === "card" ? "card" : "standard");
 
       if (fieldsRes.error) throw fieldsRes.error;
       setFields((fieldsRes.data as FormField[]) ?? []);
@@ -342,6 +363,15 @@ export function FormDetail({ formId }: { formId: string }) {
 
   function confirmDiscard() {
     setEditorDirty(false);
+    if (pendingSelection === "navigate") {
+      // Leaving the builder: drop the unsaved draft deliberately and go.
+      setPendingSelection(null);
+      setDiscardOpen(false);
+      setSelectedFieldId(null);
+      setPropsSheetOpen(false);
+      router.push("/dashboard/forms/");
+      return;
+    }
     if (pendingSelection === "cancel" || pendingSelection === null) {
       setSelectedFieldId(null);
       setPropsSheetOpen(false);
@@ -351,6 +381,20 @@ export function FormDetail({ formId }: { formId: string }) {
     }
     setPendingSelection(null);
     setDiscardOpen(false);
+  }
+
+  /**
+   * Back-link guard: navigating away with unsaved edits (field draft or
+   * form settings) is a deliberate choice, never a silent loss. The
+   * same discard dialog handles it with a navigation-aware action.
+   */
+  function requestLeaveBuilder() {
+    if (formDetailsDirty || editorDirty) {
+      setPendingSelection("navigate");
+      setDiscardOpen(true);
+      return;
+    }
+    router.push("/dashboard/forms/");
   }
 
   /* ---------------- Form-level mutations ---------------- */
@@ -370,6 +414,11 @@ export function FormDetail({ formId }: { formId: string }) {
     const trimmedLabel = submitLabel.trim().slice(0, 40);
     if (trimmedLabel) nextSettings.submit_button_label = trimmedLabel;
     else delete nextSettings.submit_button_label;
+    // Presentation mode — stored only when it is not the default, the
+    // same convention as submit_button_label. Flows into the publish
+    // snapshot (006 snapshots settings wholesale) and the public form.
+    if (formMode === "card") nextSettings.mode = "card";
+    else delete nextSettings.mode;
 
     const { error } = await supabaseBrowser
       .from("forms")
@@ -411,7 +460,7 @@ export function FormDetail({ formId }: { formId: string }) {
 
   /* ---------------- Field mutations ---------------- */
 
-  async function addField(type: FieldType) {
+  async function addField(entry: LibraryEntry) {
     if (!form) return;
     if (fields.length >= MAX_FIELDS_PER_FORM) {
       toast.error("Field limit reached.", {
@@ -419,7 +468,8 @@ export function FormDetail({ formId }: { formId: string }) {
       });
       return;
     }
-    const label = fieldLabel(type);
+    const label = entry.defaultLabel;
+    const type = entry.type;
     setAddingField(type);
     try {
       const existingKeys = fields.map((f) => f.field_key);
@@ -427,9 +477,9 @@ export function FormDetail({ formId }: { formId: string }) {
       const nextOrder =
         fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
 
-      // Type-appropriate default config from the CENTRALIZED registry
-      // (selects start with valid options, ratings with max=5).
-      const defaultConfig = defaultConfigForType(type);
+      // Entry-appropriate default config (presets like NPS/Slider/Ranking
+      // carry their tuned defaults; selects start with valid options).
+      const defaultConfig = entry.defaultConfig();
 
       const { data, error } = await supabaseBrowser
         .from("form_fields")
@@ -453,7 +503,7 @@ export function FormDetail({ formId }: { formId: string }) {
       setFields((prev) => [...prev, data as FormField]);
       selectField(data.id);
       if (!isDesktop) setLibrarySheetOpen(false);
-      toast.success(`${label} field added.`);
+      toast.success(`${entry.label} field added.`);
       // Bring the new card into view (data-attr lookup — no ref plumbing).
       window.requestAnimationFrame(() => {
         document
@@ -676,10 +726,13 @@ export function FormDetail({ formId }: { formId: string }) {
     >
       {/* ================= Toolbar (never scrolls away) ================= */}
       <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-2xl border-2 border-foreground/10 bg-surface p-2.5 sm:gap-3 sm:p-3">
-        <Button asChild variant="ghost" size="icon-sm" aria-label="Back to forms">
-          <Link href="/dashboard/forms/">
-            <ArrowLeft className="h-4 w-4" />
-          </Link>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label="Back to forms"
+          onClick={requestLeaveBuilder}
+        >
+          <ArrowLeft className="h-4 w-4" />
         </Button>
 
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
@@ -790,9 +843,14 @@ export function FormDetail({ formId }: { formId: string }) {
         />
 
         {/* ── Center: live canvas (own scroll context) ── */}
+        {/* Clicking unused canvas space deselects the field so the right
+            panel returns to Form Settings (field cards stop propagation). */}
         <main
           className="min-w-0 flex-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-[color:var(--surface)]/60 p-3 sm:p-4 lg:p-5"
           aria-label="Form canvas"
+          onClick={() => {
+            if (selectedFieldId) selectField(null);
+          }}
         >
           <div className="mx-auto w-full max-w-2xl">
             {/* Respondent-view header (read-only preview of form intro) */}
@@ -814,6 +872,7 @@ export function FormDetail({ formId }: { formId: string }) {
                 <p className="mt-2.5 text-xs text-muted-foreground/80">
                   {fields.length} field{fields.length === 1 ? "" : "s"}
                   {submitLabel.trim() ? ` · button “${submitLabel.trim()}”` : ""}
+                  {savedMode === "card" ? " · card mode" : ""}
                 </p>
               </div>
             </div>
@@ -923,9 +982,11 @@ export function FormDetail({ formId }: { formId: string }) {
             name={name}
             description={description}
             submitLabel={submitLabel}
+            formMode={formMode}
             onName={setName}
             onDescription={setDescription}
             onSubmitLabel={setSubmitLabel}
+            onFormMode={setFormMode}
             onSaveForm={saveForm}
             formDetailsDirty={formDetailsDirty}
             onOpenShare={() => setShareOpen(true)}
@@ -1020,7 +1081,7 @@ export function FormDetail({ formId }: { formId: string }) {
         formId={form.id}
         formName={form.name}
         fieldCount={fields.length}
-        hasFileUpload={hasFileUpload}
+        blockedTypes={blockedTypes}
         onPublished={({ version }) => {
           setForm((prev) =>
             prev ? { ...prev, status: "published", published_version: version } : prev,
@@ -1097,10 +1158,13 @@ export function FormDetail({ formId }: { formId: string }) {
       <AlertDialog open={discardOpen} onOpenChange={setDiscardOpen}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Discard unsaved edits?</AlertDialogTitle>
+            <AlertDialogTitle>
+              {pendingSelection === "navigate" ? "Leave with unsaved edits?" : "Discard unsaved edits?"}
+            </AlertDialogTitle>
             <AlertDialogDescription>
-              This field has changes that were never saved to the database. Discarding
-              them cannot be undone.
+              {pendingSelection === "navigate"
+                ? "You have changes that were never saved to the database. Leaving now discards them — this cannot be undone."
+                : "This field has changes that were never saved to the database. Discarding them cannot be undone."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1108,7 +1172,7 @@ export function FormDetail({ formId }: { formId: string }) {
               Keep editing
             </AlertDialogCancel>
             <AlertDialogAction onClick={confirmDiscard}>
-              Discard changes
+              {pendingSelection === "navigate" ? "Discard and leave" : "Discard changes"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1143,7 +1207,7 @@ function LibraryPane({
 }: {
   pinned: boolean;
   onTogglePin: () => void;
-  onAdd: (type: FieldType) => void;
+  onAdd: (entry: LibraryEntry) => void;
   disabled: boolean;
   fieldCount: number;
 }) {
@@ -1249,13 +1313,13 @@ function LibraryPane({
             >
               {group.label}
             </p>
-            {FIELD_TYPES_BY_GROUP[group.key].map((t) => {
+            {LIBRARY_BY_GROUP[group.key].map((t) => {
               const Icon = t.icon;
               return (
                 <button
-                  key={t.value}
+                  key={t.key}
                   type="button"
-                  onClick={() => onAdd(t.value)}
+                  onClick={() => onAdd(t)}
                   disabled={disabled}
                   className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[color:var(--memphis-coral)]/12 hover:text-[color:var(--memphis-coral)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                   aria-label={`Add ${t.label} field`}
@@ -1321,7 +1385,7 @@ function EmptyCanvas({
   isDesktop,
   onOpenLibrary,
 }: {
-  onAdd: (type: FieldType) => void;
+  onAdd: (entry: LibraryEntry) => void;
   disabled: boolean;
   isDesktop: boolean;
   onOpenLibrary: () => void;
@@ -1342,20 +1406,19 @@ function EmptyCanvas({
       </p>
 
       <div className="mx-auto mt-5 grid max-w-xs grid-cols-2 gap-2">
-        {QUICK_START.map((type) => {
-          const def = fieldDef(type);
-          const Icon = def.icon;
+        {QUICK_START_ENTRIES.map((entry) => {
+          const Icon = entry.icon;
           return (
             <button
-              key={type}
+              key={entry.key}
               type="button"
-              onClick={() => onAdd(type)}
+              onClick={() => onAdd(entry)}
               disabled={disabled}
               className="flex items-center gap-2 rounded-xl border-2 border-foreground/10 bg-surface px-3 py-2.5 text-left text-sm font-semibold text-foreground transition-all hover:border-[color:var(--memphis-coral)]/50 hover:bg-[color:var(--memphis-coral)]/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-              aria-label={`Add ${def.label} field`}
+              aria-label={`Add ${entry.label} field`}
             >
               <Icon className="h-4 w-4 shrink-0 text-[color:var(--memphis-coral)]" aria-hidden />
-              {def.label}
+              {entry.label}
             </button>
           );
         })}
@@ -1436,9 +1499,11 @@ function PropertiesPanel({
   name,
   description,
   submitLabel,
+  formMode,
   onName,
   onDescription,
   onSubmitLabel,
+  onFormMode,
   onSaveForm,
   formDetailsDirty,
   onOpenShare,
@@ -1456,9 +1521,11 @@ function PropertiesPanel({
   name: string;
   description: string;
   submitLabel: string;
+  formMode: "standard" | "card";
   onName: (v: string) => void;
   onDescription: (v: string) => void;
   onSubmitLabel: (v: string) => void;
+  onFormMode: (v: "standard" | "card") => void;
   onSaveForm: () => void;
   formDetailsDirty: boolean;
   onOpenShare: () => void;
@@ -1504,9 +1571,11 @@ function PropertiesPanel({
             name={name}
             description={description}
             submitLabel={submitLabel}
+            formMode={formMode}
             onName={onName}
             onDescription={onDescription}
             onSubmitLabel={onSubmitLabel}
+            onFormMode={onFormMode}
             onSave={onSaveForm}
             onOpenShare={onOpenShare}
             onSelectField={onSelectField}
@@ -1525,9 +1594,11 @@ function FormSettingsView({
   name,
   description,
   submitLabel,
+  formMode,
   onName,
   onDescription,
   onSubmitLabel,
+  onFormMode,
   onSave,
   onOpenShare,
   onSelectField,
@@ -1539,9 +1610,11 @@ function FormSettingsView({
   name: string;
   description: string;
   submitLabel: string;
+  formMode: "standard" | "card";
   onName: (v: string) => void;
   onDescription: (v: string) => void;
   onSubmitLabel: (v: string) => void;
+  onFormMode: (v: "standard" | "card") => void;
   onSave: () => void;
   onOpenShare: () => void;
   onSelectField: (id: string | null) => void;
@@ -1660,6 +1733,54 @@ function FormSettingsView({
             The button respondents press (defaults to “Submit”).
           </p>
         </div>
+        <div className="space-y-2">
+          <p className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70">
+            Form mode
+          </p>
+          <div
+            role="radiogroup"
+            aria-label="Form mode"
+            className="grid grid-cols-1 gap-2"
+          >
+            {(
+              [
+                ["standard", "Standard", "All questions on one page"],
+                ["card", "Card", "One question at a time"],
+              ] as const
+            ).map(([value, title, sub]) => (
+              <button
+                key={value}
+                type="button"
+                role="radio"
+                aria-checked={formMode === value}
+                onClick={() => onFormMode(value)}
+                disabled={saving}
+                className={cn(
+                  "rounded-xl border-2 p-3 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60",
+                  formMode === value
+                    ? "border-[color:var(--memphis-coral)] bg-[color:var(--memphis-coral)]/8"
+                    : "border-foreground/10 bg-background hover:border-foreground/25",
+                )}
+              >
+                <span className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                  {formMode === value && (
+                    <span
+                      className="inline-block h-2 w-2 rounded-full bg-[color:var(--memphis-coral)]"
+                      aria-hidden
+                    />
+                  )}
+                  {title}
+                </span>
+                <span className="mt-0.5 block text-xs text-muted-foreground">
+                  {sub}
+                </span>
+              </button>
+            ))}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            How the form is presented to respondents — save and preview to see it.
+          </p>
+        </div>
         <div className="flex items-center justify-between gap-3">
           <p className="text-[11px] text-muted-foreground" role="status">
             {dirty ? "Unsaved changes" : "Saved to database"}
@@ -1724,7 +1845,12 @@ function CanvasFieldCard({
       <div
         role="button"
         tabIndex={0}
-        onClick={onSelect}
+        onClick={(e) => {
+          // Keep the click INSIDE the card: the canvas background handler
+          // deselects on clicks that reach it — a card click must not.
+          e.stopPropagation();
+          onSelect();
+        }}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
@@ -1829,7 +1955,9 @@ function CanvasFieldCard({
           )}
         >
           <def.icon className="h-3.5 w-3.5 text-[color:var(--memphis-coral)]" aria-hidden />
-          <span className="font-semibold">{def.label}</span>
+          <span className="font-semibold">
+            {libraryLabelFor(field.field_type, field.config as Record<string, unknown> | null)}
+          </span>
           <span className="font-mono opacity-70">{field.field_key}</span>
           <span className="ml-auto opacity-70">#{index + 1}</span>
         </div>

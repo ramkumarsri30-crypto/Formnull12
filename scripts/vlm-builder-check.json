@@ -1,0 +1,28 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "1) **Yes**, there is a compact icon rail on the far left containing navigation and tool icons.\n2) **Yes**, it follows a 3-pane builder layout: left field library, center canvas, and right properties panel.\n3) **Yes**, the top toolbar displays the specific form name (\"FS2 Phase 2 Field Types\") along with Preview/Share/Republish buttons; there is no generic \"Forms\" page title or \"New form\" button visible.\n4) **No**, the layout appears clean with no visual glitches, overlapping elements, or broken components.",
+        "role": "assistant"
+      }
+    }
+  ],
+  "created": 1788458010,
+  "id": "2026090401532859a186cdf5b5402a",
+  "model": "glm-5v-turbo",
+  "object": "chat.completion",
+  "request_id": "2026090401532859a186cdf5b5402a",
+  "usage": {
+    "completion_tokens": 118,
+    "completion_tokens_details": {
+      "reasoning_tokens": 0
+    },
+    "prompt_tokens": 1776,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "total_tokens": 1894
+  }
+}

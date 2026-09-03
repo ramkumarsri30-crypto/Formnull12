@@ -54,30 +54,35 @@ function suggestValue(label: string): string {
   return slug || "option";
 }
 
-/** rows → { options, optionLabels } (labels kept only when ≠ value). */
-export function rowsToConfig(rows: OptionRow[]): {
-  options: string[];
-  optionLabels: Record<string, string>;
-} {
-  const options: string[] = [];
+/** rows → { values, labels } (labels kept only when ≠ value). Keys are
+ *  parameterized: selects use options/optionLabels, matrix rows use
+ *  rows/rowLabels, matrix columns use columns/columnLabels. */
+export function rowsToConfig(
+  rows: OptionRow[],
+  keys: { values: string; labels: string } = { values: "options", labels: "optionLabels" },
+): { values: string[]; labels: Record<string, string> } {
+  const values: string[] = [];
   const labels: Record<string, string> = {};
   for (const r of rows) {
     const value = r.value.trim();
     if (!value) continue;
-    options.push(value);
+    values.push(value);
     if (r.label.trim() && r.label.trim() !== value) {
       labels[value] = r.label.trim();
     }
   }
-  return { options, optionLabels: labels };
+  return { values, labels };
 }
 
 /** config → rows (missing labels fall back to the value). */
-export function configToRows(config: Record<string, unknown>): OptionRow[] {
-  const options = Array.isArray(config.options)
-    ? (config.options as unknown[]).filter((o): o is string => typeof o === "string")
+export function configToRows(
+  config: Record<string, unknown>,
+  keys: { values: string; labels: string } = { values: "options", labels: "optionLabels" },
+): OptionRow[] {
+  const options = Array.isArray(config[keys.values])
+    ? (config[keys.values] as unknown[]).filter((o): o is string => typeof o === "string")
     : [];
-  const rawLabels = config.optionLabels;
+  const rawLabels = config[keys.labels];
   const labels =
     rawLabels && typeof rawLabels === "object" && !Array.isArray(rawLabels)
       ? (rawLabels as Record<string, unknown>)
@@ -112,12 +117,15 @@ export function OptionListEditor({
   onChange,
   disabled,
   errors,
+  itemNoun = "option",
 }: {
   rows: OptionRow[];
   onChange: (rows: OptionRow[]) => void;
   disabled: boolean;
   /** Field-level validation error surfaced under the list. */
   errors?: string | null;
+  /** "option" | "row" | "column" — matrix edits two lists. */
+  itemNoun?: string;
 }) {
   const [nextLabel, setNextLabel] = useState("");
 
@@ -138,7 +146,7 @@ export function OptionListEditor({
 
   function addOption(label: string) {
     const trimmed = label.trim();
-    const display = trimmed || `Option ${rows.length + 1}`;
+    const display = trimmed || `${itemNoun === "option" ? "Option" : itemNoun === "row" ? "Row" : "Column"} ${rows.length + 1}`;
     const value = uniqueValue(suggestValue(display), rows, -1);
     onChange([...rows, { value, label: display, valueEdited: false }]);
   }
@@ -159,7 +167,10 @@ export function OptionListEditor({
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <Label className="text-xs">{rows.length} option{rows.length === 1 ? "" : "s"}</Label>
+        <Label className="text-xs">
+          {rows.length} {itemNoun}
+          {rows.length === 1 ? "" : "s"}
+        </Label>
         <p className="text-[10px] text-muted-foreground/80">reorder · rename · edit value</p>
       </div>
 
@@ -214,8 +225,8 @@ export function OptionListEditor({
                   }}
                   disabled={disabled}
                   className="h-9 min-w-0 flex-1"
-                  placeholder={`Option ${i + 1}`}
-                  aria-label={`Label for option ${i + 1}`}
+                  placeholder={`${itemNoun === "option" ? "Option" : itemNoun === "row" ? "Row" : "Column"} ${i + 1}`}
+                  aria-label={`Label for ${itemNoun} ${i + 1}`}
                   maxLength={MAX_OPTION_LEN}
                 />
 
@@ -287,9 +298,9 @@ export function OptionListEditor({
             }
           }}
           disabled={disabled}
-          placeholder={`Option ${rows.length + 1}`}
+          placeholder={`${itemNoun === "option" ? "Option" : itemNoun === "row" ? "Row" : "Column"} ${rows.length + 1}`}
           className="h-9"
-          aria-label="New option label"
+          aria-label={`New ${itemNoun} label`}
           maxLength={MAX_OPTION_LEN}
         />
         <Button

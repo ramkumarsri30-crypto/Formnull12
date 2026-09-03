@@ -1,0 +1,1188 @@
+     1→/**
+     2→ * FormNull — Field System 2.0 Registry
+     3→ * =====================================================================
+     4→ * THE single source of truth for what a field type IS and what it can
+     5→ * be configured to do. Consumers:
+     6→ *
+     7→ *   - field-library.tsx       which types can be ADDED (status=active)
+     8→ *   - field-property-editor   which properties exist per type (schema)
+     9→ *   - form-renderer.tsx       renders every type, incl. legacy
+    10→ *   - publish/public submit   enforced by migration 006 (server side)
+    11→ *
+    12→ * ── STATUS MODEL ─────────────────────────────────────────────────────
+    13→ *   active : offered in the field library, full Field System 2.0
+    14→ *            property depth (first 10 types of the rebuild).
+    15→ *   legacy : NOT offered for new fields, but existing forms keep
+    16→ *            rendering / editing / publishing / submitting them
+    17→ *            through this same registry (compatibility layer — no
+    18→ *            destructive migration, no data loss).
+    19→ *
+    20→ * ── HONEST-PROPERTY PRINCIPLE (extends the Phase 3 rule) ────────────
+    21→ * Every PropertyDefinition declares where it lives and who enforces it:
+    22→ *
+    23→ *   target: "column"  → a real form_fields column (002/006 snapshot)
+    24→ *   target: "config"  → a key inside form_fields.config (jsonb)
+    25→ *
+    26→ *   enforcement:
+    27→ *     "server"       → submit_public_form (006) validates it on every
+    28→ *                      public submission. Fully honest validation.
+    29→ *     "client"       → enforced by the shared renderer only (e.g. the
+    30→ *                      short_text JS `pattern`, decimal `precision`).
+    31→ *                      Documented as a browser-side check; the server
+    32→ *                      still applies its own type/length backstop.
+    33→ *     "presentation" → changes rendering only (labels, symbols,
+    34→ *                      rows). Flows through the 006 snapshot to the
+    35→ *                      public form unchanged.
+    36→ *
+    37→ * No property is declared unless at least one of those is true. No UI
+    38→ * control ships without a real consumer.
+    39→ *
+    40→ * ── EXTENSION CONTRACT (Logic / Calculations / Themes / Integrations) ──
+    41→ * Future systems must be able to reason about fields WITHOUT touching
+    42→ * the field model. They consume, they do not rewrite:
+    43→ *   - `answerType`  : the JSON shape a submitted answer takes — Logic
+    44→ *                     conditions and Calculations branch on this.
+    45→ *   - `collectsData`: whether the field participates in submissions.
+    46→ *   - `publishable` : whether it can enter a published snapshot.
+    47→ * A "card / one-question-at-a-time" form mode consumes the exact same
+    48→ * field rows — presentation mode is a renderer concern, never a field
+    49→ * definition concern.
+    50→ */
+    51→import type { FieldType } from "@/lib/supabase/types";
+    52→import type { LucideIcon } from "lucide-react";
+    53→export type { FieldType };
+    54→import {
+    55→  Type,
+    56→  AlignLeft,
+    57→  Mail,
+    58→  Phone,
+    59→  Link2,
+    60→  Hash,
+    61→  Sigma,
+    62→  SquareCheck,
+    63→  Calendar,
+    64→  Clock,
+    65→  ChevronDown,
+    66→  ListChecks,
+    67→  Star,
+    68→  SlidersHorizontal,
+    69→  Upload,
+    70→  Heading2,
+    71→} from "lucide-react";
+    72→
+    73→/* ------------------------------------------------------------------ */
+    74→/* Property system types                                               */
+    75→/* ------------------------------------------------------------------ */
+    76→
+    77→/** Sections render in this order in the property editor. */
+    78→export const PROPERTY_SECTION_ORDER = [
+    79→  "general",
+    80→  "content",
+    81→  "options",
+    82→  "validation",
+    83→  "appearance",
+    84→  "behavior",
+    85→] as const;
+    86→
+    87→export type PropertySection = (typeof PROPERTY_SECTION_ORDER)[number];
+    88→
+    89→export const SECTION_LABELS: Record<PropertySection, string> = {
+    90→  general: "General",
+    91→  content: "Content",
+    92→  options: "Options",
+    93→  validation: "Validation",
+    94→  appearance: "Appearance",
+    95→  behavior: "Behavior",
+    96→};
+    97→
+    98→/** Who guarantees a validation-ish property actually works. */
+    99→export type Enforcement = "server" | "client" | "presentation";
+   100→
+   101→/** Widget used by the generic property editor. */
+   102→export type PropertyControl =
+   103→  | "text"
+   104→  | "textarea"
+   105→  | "number"
+   106→  | "switch"
+   107→  | "width"
+   108→  | "select"
+   109→  | "options-editor"
+   110→  | "default-country";
+   111→
+   112→export interface PropertyDefinition {
+   113→  /** config key (target=config) or column name (target=column). */
+   114→  key: string;
+   115→  label: string;
+   116→  section: PropertySection;
+   117→  target: "column" | "config";
+   118→  control: PropertyControl;
+   119→  enforcement?: Enforcement;
+   120→  /** One-line hint under the control. */
+   121→  hint?: string;
+   122→  placeholder?: string;
+   123→  min?: number;
+   124→  max?: number;
+   125→  step?: number;
+   126→  /** Span both grid columns (labels, long inputs). */
+   127→  fullWidth?: boolean;
+   128→  /** Only render when the existing config already carries the key —
+   129→   *  used to keep managing legacy settings honestly instead of
+   130→   *  hiding them (e.g. phone minLength from pre-rebuild fields). */
+   131→  visibleWhenPresent?: boolean;
+   132→  /** Choices for control="select". */
+   133→  choices?: { value: string; label: string }[];
+   134→}
+   135→
+   136→/* ------------------------------------------------------------------ */
+   137→/* Field type definition                                               */
+   138→/* ------------------------------------------------------------------ */
+   139→
+   140→/** Library grouping for ACTIVE types (the mental model of the rail). */
+   141→export type FieldGroup = "text" | "contact" | "numbers" | "choice";
+   142→
+   143→export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
+   144→  { key: "text", label: "Text" },
+   145→  { key: "contact", label: "Contact" },
+   146→  { key: "numbers", label: "Numbers" },
+   147→  { key: "choice", label: "Choice" },
+   148→];
+   149→
+   150→/**
+   151→ * The JSON shape one submitted answer takes. The axis every future
+   152→ * Logic / Calculation / Integration ruleset branches on.
+   153→ */
+   154→export type AnswerType = "string" | "number" | "boolean" | "string[]" | "none";
+   155→
+   156→export interface FieldTypeDef {
+   157→  value: FieldType;
+   158→  label: string;
+   159→  icon: LucideIcon;
+   160→  /** One-line explanation (library + canvas badges). */
+   161→  description: string;
+   162→  group?: FieldGroup;
+   163→  /** active = addable in the library. legacy = compatibility only. */
+   164→  status: "active" | "legacy";
+   165→  answerType: AnswerType;
+   166→  collectsData: boolean;
+   167→  publishable: boolean;
+   168→  defaultLabel: string;
+   169→  /** Config written on field creation (selects need valid options). */
+   170→  defaultConfig: () => Record<string, unknown>;
+   171→  /** The complete property set — exactly what this type supports. */
+   172→  properties: PropertyDefinition[];
+   173→  /**
+   174→   * Static note shown at the top of the Validation section when the
+   175→   * type has built-in (non-configurable) server validation.
+   176→   */
+   177→  validationNote?: string;
+   178→}
+   179→
+   180→/* ------------------------------------------------------------------ */
+   181→/* Shared limits — mirror migration 006 (documented, never invented)   */
+   182→/* ------------------------------------------------------------------ */
+   183→
+   184→export const MAX_FIELDS_PER_FORM = 300;
+   185→export const FIELD_LIMIT_WARN_AT = 280;
+   186→/** 006 c_max_options — options per select field. */
+   187→export const MAX_OPTIONS_PER_FIELD = 100;
+   188→/** 006 c_max_option_len — characters per option value. */
+   189→export const MAX_OPTION_LEN = 200;
+   190→/** 006 c_max_label_len. */
+   191→export const MAX_LABEL_LEN = 500;
+   192→/** 006 c_max_text_len — description/placeholder/help_text columns. */
+   193→export const MAX_TEXT_LEN = 2000;
+   194→/** 006 c_max_pattern_len. */
+   195→export const MAX_PATTERN_LEN = 512;
+   196→/** 006 c_max_cfg_value_len — bound for minLength/maxLength values. */
+   197→export const MAX_LENGTH_CFG = 10000;
+   198→/** Presentation-only end labels (scale/rating) — kept at the Phase 3
+   199→ *  value so old and new fields behave identically. */
+   200→export const MAX_END_LABEL_LEN = 60;
+   201→/** Cap for presentation-only config values (symbols, labels map). */
+   202→export const MAX_PRESENTATION_LEN = 200;
+   203→
+   204→/* ------------------------------------------------------------------ */
+   205→/* Reusable property fragments                                         */
+   206→/* ------------------------------------------------------------------ */
+   207→
+   208→const P_LABEL: PropertyDefinition = {
+   209→  key: "label",
+   210→  label: "Label",
+   211→  section: "general",
+   212→  target: "column",
+   213→  control: "text",
+   214→  placeholder: "Question shown to respondents",
+   215→  fullWidth: true,
+   216→};
+   217→
+   218→const P_DESCRIPTION: PropertyDefinition = {
+   219→  key: "description",
+   220→  label: "Description",
+   221→  section: "general",
+   222→  target: "column",
+   223→  control: "textarea",
+   224→  hint: "Extra context under the label",
+   225→  placeholder: "Optional",
+   226→  fullWidth: true,
+   227→};
+   228→
+   229→const P_REQUIRED: PropertyDefinition = {
+   230→  key: "is_required",
+   231→  label: "Required",
+   232→  section: "general",
+   233→  target: "column",
+   234→  control: "switch",
+   235→  hint: "Respondents must fill this in",
+   236→};
+   237→
+   238→const P_WIDTH: PropertyDefinition = {
+   239→  key: "width",
+   240→  label: "Width",
+   241→  section: "general",
+   242→  target: "column",
+   243→  control: "width",
+   244→  hint: "How much of a row this field takes",
+   245→};
+   246→
+   247→const P_PLACEHOLDER: PropertyDefinition = {
+   248→  key: "placeholder",
+   249→  label: "Placeholder",
+   250→  section: "content",
+   251→  target: "column",
+   252→  control: "text",
+   253→  hint: "Faded example text inside the input",
+   254→  placeholder: "Optional",
+   255→};
+   256→
+   257→const P_HELP: PropertyDefinition = {
+   258→  key: "help_text",
+   259→  label: "Help text",
+   260→  section: "content",
+   261→  target: "column",
+   262→  control: "text",
+   263→  hint: "Shown under the input",
+   264→  placeholder: "Optional",
+   265→};
+   266→
+   267→const P_MIN_LENGTH: PropertyDefinition = {
+   268→  key: "minLength",
+   269→  label: "Min length",
+   270→  section: "validation",
+   271→  target: "config",
+   272→  control: "number",
+   273→  enforcement: "server",
+   274→  min: 0,
+   275→  max: MAX_LENGTH_CFG,
+   276→  hint: "Fewest characters accepted",
+   277→};
+   278→
+   279→const P_MAX_LENGTH: PropertyDefinition = {
+   280→  key: "maxLength",
+   281→  label: "Max length",
+   282→  section: "validation",
+   283→  target: "config",
+   284→  control: "number",
+   285→  enforcement: "server",
+   286→  min: 1,
+   287→  max: MAX_LENGTH_CFG,
+   288→  hint: "Most characters accepted",
+   289→};
+   290→
+   291→const P_MIN: PropertyDefinition = {
+   292→  key: "min",
+   293→  label: "Min",
+   294→  section: "validation",
+   295→  target: "config",
+   296→  control: "number",
+   297→  enforcement: "server",
+   298→  hint: "Smallest accepted answer",
+   299→};
+   300→
+   301→const P_MAX: PropertyDefinition = {
+   302→  key: "max",
+   303→  label: "Max",
+   304→  section: "validation",
+   305→  target: "config",
+   306→  control: "number",
+   307→  enforcement: "server",
+   308→  hint: "Largest accepted answer",
+   309→};
+   310→
+   311→const P_STEP: PropertyDefinition = {
+   312→  key: "step",
+   313→  label: "Step",
+   314→  section: "validation",
+   315→  target: "config",
+   316→  control: "number",
+   317→  enforcement: "server",
+   318→  hint: "Answers must align to steps counting from Min",
+   319→  min: 0.000001,
+   320→};
+   321→
+   322→/** Rating scale steps (config.max — server-enforced 2..10 by 006). */
+   323→const P_RATING_SCALE: PropertyDefinition = {
+   324→  key: "max",
+   325→  label: "Scale",
+   326→  section: "validation",
+   327→  target: "config",
+   328→  control: "number",
+   329→  enforcement: "server",
+   330→  min: 2,
+   331→  max: 10,
+   332→  step: 1,
+   333→  hint: "Number of steps — e.g. 5 gives five stars",
+   334→};
+   335→
+   336→/* ------------------------------------------------------------------ */
+   337→/* THE REGISTRY                                                        */
+   338→/* ------------------------------------------------------------------ */
+   339→
+   340→export const FIELD_REGISTRY: FieldTypeDef[] = [
+   341→  /* ── ACTIVE (first 10 of the Field System 2.0 rebuild) ─────────── */
+   342→
+   343→  {
+   344→    value: "short_text",
+   345→    label: "Short text",
+   346→    icon: Type,
+   347→    description: "Single-line answer for names, titles, short facts.",
+   348→    group: "text",
+   349→    status: "active",
+   350→    answerType: "string",
+   351→    collectsData: true,
+   352→    publishable: true,
+   353→    defaultLabel: "Short text",
+   354→    defaultConfig: () => ({}),
+   355→    properties: [
+   356→      P_LABEL,
+   357→      P_DESCRIPTION,
+   358→      P_REQUIRED,
+   359→      P_WIDTH,
+   360→      P_PLACEHOLDER,
+   361→      P_HELP,
+   362→      P_MIN_LENGTH,
+   363→      P_MAX_LENGTH,
+   364→      {
+   365→        key: "pattern",
+   366→        label: "Pattern",
+   367→        section: "validation",
+   368→        target: "config",
+   369→        control: "text",
+   370→        enforcement: "client",
+   371→        hint: "JavaScript regex checked while respondents type. The server always checks length.",
+   372→        placeholder: "^[A-Z]{3}-\\d{4}$",
+   373→        fullWidth: true,
+   374→      },
+   375→    ],
+   376→    validationNote:
+   377→      "Length rules are enforced on every public submission (server-side).",
+   378→  },
+   379→
+   380→  {
+   381→    value: "long_text",
+   382→    label: "Long text",
+   383→    icon: AlignLeft,
+   384→    description: "Multi-line answer for open feedback and comments.",
+   385→    group: "text",
+   386→    status: "active",
+   387→    answerType: "string",
+   388→    collectsData: true,
+   389→    publishable: true,
+   390→    defaultLabel: "Long text",
+   391→    defaultConfig: () => ({ rows: 4 }),
+   392→    properties: [
+   393→      P_LABEL,
+   394→      P_DESCRIPTION,
+   395→      P_REQUIRED,
+   396→      P_WIDTH,
+   397→      P_PLACEHOLDER,
+   398→      P_HELP,
+   399→      {
+   400→        key: "rows",
+   401→        label: "Rows",
+   402→        section: "appearance",
+   403→        target: "config",
+   404→        control: "number",
+   405→        enforcement: "presentation",
+   406→        min: 2,
+   407→        max: 10,
+   408→        step: 1,
+   409→        hint: "Visible height of the answer box (2–10)",
+   410→      },
+   411→      P_MIN_LENGTH,
+   412→      P_MAX_LENGTH,
+   413→    ],
+   414→    validationNote:
+   415→      "Length rules are enforced on every public submission (server-side).",
+   416→  },
+   417→
+   418→  {
+   419→    value: "email",
+   420→    label: "Email",
+   421→    icon: Mail,
+   422→    description: "Email address with built-in format validation.",
+   423→    group: "contact",
+   424→    status: "active",
+   425→    answerType: "string",
+   426→    collectsData: true,
+   427→    publishable: true,
+   428→    defaultLabel: "Email",
+   429→    defaultConfig: () => ({}),
+   430→    properties: [
+   431→      P_LABEL,
+   432→      P_DESCRIPTION,
+   433→      P_REQUIRED,
+   434→      P_WIDTH,
+   435→      P_PLACEHOLDER,
+   436→      P_HELP,
+   437→    ],
+   438→    validationNote:
+   439→      "Answers must be a valid email address — checked on every public submission (server-side).",
+   440→  },
+   441→
+   442→  {
+   443→    value: "phone",
+   444→    label: "Phone number",
+   445→    icon: Phone,
+   446→    description: "International phone number with country selector.",
+   447→    group: "contact",
+   448→    status: "active",
+   449→    answerType: "string",
+   450→    collectsData: true,
+   451→    publishable: true,
+   452→    defaultLabel: "Phone number",
+   453→    defaultConfig: () => ({}),
+   454→    properties: [
+   455→      P_LABEL,
+   456→      P_DESCRIPTION,
+   457→      P_REQUIRED,
+   458→      P_WIDTH,
+   459→      {
+   460→        ...P_PLACEHOLDER,
+   461→        hint: "Faded example text inside the number box",
+   462→      },
+   463→      P_HELP,
+   464→      {
+   465→        key: "defaultCountry",
+   466→        label: "Default country",
+   467→        section: "behavior",
+   468→        target: "config",
+   469→        control: "default-country",
+   470→        enforcement: "presentation",
+   471→        hint: "Pre-selects the calling code respondents start with",
+   472→        fullWidth: true,
+   473→      },
+   474→      // Pre-rebuild phone fields may carry string length rules (both
+   475→      // are server-enforced on the stored international string). Keep
+   476→      // them manageable instead of hiding them.
+   477→      {
+   478→        ...P_MIN_LENGTH,
+   479→        hint: "Applies to the full stored number, country code included",
+   480→        visibleWhenPresent: true,
+   481→      },
+   482→      {
+   483→        ...P_MAX_LENGTH,
+   484→        hint: "Applies to the full stored number, country code included",
+   485→        visibleWhenPresent: true,
+   486→      },
+   487→    ],
+   488→    validationNote:
+   489→      "Answers are stored as international strings like +91 98765 43210. The format is validated on every public submission (server-side).",
+   490→  },
+   491→
+   492→  {
+   493→    value: "number",
+   494→    label: "Number",
+   495→    icon: Hash,
+   496→    description: "Whole-number answer with min/max/step control.",
+   497→    group: "numbers",
+   498→    status: "active",
+   499→    answerType: "number",
+   500→    collectsData: true,
+   501→    publishable: true,
+   502→    defaultLabel: "Number",
+   503→    defaultConfig: () => ({}),
+   504→    properties: [
+   505→      P_LABEL,
+   506→      P_DESCRIPTION,
+   507→      P_REQUIRED,
+   508→      P_WIDTH,
+   509→      P_PLACEHOLDER,
+   510→      P_HELP,
+   511→      P_MIN,
+   512→      P_MAX,
+   513→      P_STEP,
+   514→    ],
+   515→    validationNote:
+   516→      "Whole-number, range and step rules are enforced on every public submission (server-side).",
+   517→  },
+   518→
+   519→  {
+   520→    value: "decimal",
+   521→    label: "Decimal",
+   522→    icon: Sigma,
+   523→    description: "Decimal answer (prices, measurements) with range control.",
+   524→    group: "numbers",
+   525→    status: "active",
+   526→    answerType: "number",
+   527→    collectsData: true,
+   528→    publishable: true,
+   529→    defaultLabel: "Decimal",
+   530→    defaultConfig: () => ({}),
+   531→    properties: [
+   532→      P_LABEL,
+   533→      P_DESCRIPTION,
+   534→      P_REQUIRED,
+   535→      P_WIDTH,
+   536→      P_PLACEHOLDER,
+   537→      P_HELP,
+   538→      P_MIN,
+   539→      P_MAX,
+   540→      P_STEP,
+   541→      {
+   542→        key: "precision",
+   543→        label: "Precision",
+   544→        section: "appearance",
+   545→        target: "config",
+   546→        control: "number",
+   547→        enforcement: "client",
+   548→        min: 0,
+   549→        max: 6,
+   550→        step: 1,
+   551→        hint: "Most decimal places respondents can enter (0–6)",
+   552→      },
+   553→    ],
+   554→    validationNote:
+   555→      "Range and step rules are enforced on every public submission (server-side). Precision is enforced in the browser.",
+   556→  },
+   557→
+   558→  {
+   559→    value: "single_select",
+   560→    label: "Dropdown",
+   561→    icon: ChevronDown,
+   562→    description: "One choice from a list you define.",
+   563→    group: "choice",
+   564→    status: "active",
+   565→    answerType: "string",
+   566→    collectsData: true,
+   567→    publishable: true,
+   568→    defaultLabel: "Dropdown",
+   569→    defaultConfig: () => ({ options: ["Option 1", "Option 2"] }),
+   570→    properties: [
+   571→      P_LABEL,
+   572→      P_DESCRIPTION,
+   573→      P_REQUIRED,
+   574→      P_WIDTH,
+   575→      {
+   576→        ...P_PLACEHOLDER,
+   577→        hint: "Text shown before a choice is made",
+   578→      },
+   579→      P_HELP,
+   580→      {
+   581→        key: "options",
+   582→        label: "Options",
+   583→        section: "options",
+   584→        target: "config",
+   585→        control: "options-editor",
+   586→        enforcement: "server",
+   587→        hint: "Each option has a display label and a stable value that is stored in responses",
+   588→        fullWidth: true,
+   589→      },
+   590→    ],
+   591→    validationNote:
+   592→      "Answers must exactly match one option value — enforced on every public submission (server-side).",
+   593→  },
+   594→
+   595→  {
+   596→    value: "multi_select",
+   597→    label: "Multi-select",
+   598→    icon: ListChecks,
+   599→    description: "Any number of choices from a list you define.",
+   600→    group: "choice",
+   601→    status: "active",
+   602→    answerType: "string[]",
+   603→    collectsData: true,
+   604→    publishable: true,
+   605→    defaultLabel: "Multi-select",
+   606→    defaultConfig: () => ({ options: ["Option 1", "Option 2"] }),
+   607→    properties: [
+   608→      P_LABEL,
+   609→      P_DESCRIPTION,
+   610→      P_REQUIRED,
+   611→      P_WIDTH,
+   612→      P_HELP,
+   613→      {
+   614→        key: "options",
+   615→        label: "Options",
+   616→        section: "options",
+   617→        target: "config",
+   618→        control: "options-editor",
+   619→        enforcement: "server",
+   620→        hint: "Each option has a display label and a stable value that is stored in responses",
+   621→        fullWidth: true,
+   622→      },
+   623→    ],
+   624→    validationNote:
+   625→      "Answers must match option values, with no duplicates — enforced on every public submission (server-side).",
+   626→  },
+   627→
+   628→  {
+   629→    value: "boolean",
+   630→    label: "Checkbox",
+   631→    icon: SquareCheck,
+   632→    description: "A single yes/no style checkbox.",
+   633→    group: "choice",
+   634→    status: "active",
+   635→    answerType: "boolean",
+   636→    collectsData: true,
+   637→    publishable: true,
+   638→    defaultLabel: "Checkbox",
+   639→    defaultConfig: () => ({}),
+   640→    properties: [
+   641→      P_LABEL,
+   642→      P_DESCRIPTION,
+   643→      {
+   644→        ...P_REQUIRED,
+   645→        hint: "Respondents must check the box to submit",
+   646→      },
+   647→      P_WIDTH,
+   648→      {
+   649→        key: "help_text",
+   650→        label: "Checkbox text",
+   651→        section: "content",
+   652→        target: "column",
+   653→        control: "text",
+   654→        hint: "Shown beside the checkbox — e.g. “I agree”",
+   655→        placeholder: "I agree",
+   656→      },
+   657→    ],
+   658→    validationNote:
+   659→      "Stored as a real true/false. A required checkbox must be checked in the browser; the server accepts an explicit false.",
+   660→  },
+   661→
+   662→  {
+   663→    value: "rating",
+   664→    label: "Rating",
+   665→    icon: Star,
+   666→    description: "Tap-a-symbol rating, 2–10 steps.",
+   667→    group: "choice",
+   668→    status: "active",
+   669→    answerType: "number",
+   670→    collectsData: true,
+   671→    publishable: true,
+   672→    defaultLabel: "Rating",
+   673→    defaultConfig: () => ({ max: 5 }),
+   674→    properties: [
+   675→      P_LABEL,
+   676→      P_DESCRIPTION,
+   677→      P_REQUIRED,
+   678→      P_WIDTH,
+   679→      P_HELP,
+   680→      P_RATING_SCALE,
+   681→      {
+   682→        key: "symbol",
+   683→        label: "Symbol",
+   684→        section: "appearance",
+   685→        target: "config",
+   686→        control: "select",
+   687→        enforcement: "presentation",
+   688→        choices: [
+   689→          { value: "star", label: "Star" },
+   690→          { value: "heart", label: "Heart" },
+   691→          { value: "thumb", label: "Thumbs up" },
+   692→          { value: "circle", label: "Circle" },
+   693→        ],
+   694→        placeholder: "Star",
+   695→        hint: "What respondents tap",
+   696→      },
+   697→      {
+   698→        key: "leftLabel",
+   699→        label: "Left label",
+   700→        section: "appearance",
+   701→        target: "config",
+   702→        control: "text",
+   703→        enforcement: "presentation",
+   704→        placeholder: "Not at all",
+   705→      },
+   706→      {
+   707→        key: "rightLabel",
+   708→        label: "Right label",
+   709→        section: "appearance",
+   710→        target: "config",
+   711→        control: "text",
+   712→        enforcement: "presentation",
+   713→        placeholder: "Absolutely",
+   714→      },
+   715→    ],
+   716→    validationNote:
+   717→      "Answers are whole numbers from 1 to the scale — enforced on every public submission (server-side).",
+   718→  },
+   719→
+   720→  /* ── LEGACY (existing forms only — full compatibility) ─────────── */
+   721→
+   722→  {
+   723→    value: "url",
+   724→    label: "Website",
+   725→    icon: Link2,
+   726→    description: "URL with built-in format validation.",
+   727→    status: "legacy",
+   728→    answerType: "string",
+   729→    collectsData: true,
+   730→    publishable: true,
+   731→    defaultLabel: "Website",
+   732→    defaultConfig: () => ({}),
+   733→    properties: [
+   734→      P_LABEL,
+   735→      P_DESCRIPTION,
+   736→      P_REQUIRED,
+   737→      P_WIDTH,
+   738→      P_PLACEHOLDER,
+   739→      P_HELP,
+   740→      P_MIN_LENGTH,
+   741→      P_MAX_LENGTH,
+   742→    ],
+   743→    validationNote:
+   744→      "Answers must be a URL starting with http:// or https:// — enforced on every public submission (server-side).",
+   745→  },
+   746→
+   747→  {
+   748→    value: "date",
+   749→    label: "Date",
+   750→    icon: Calendar,
+   751→    description: "A calendar date picker (YYYY-MM-DD).",
+   752→    status: "legacy",
+   753→    answerType: "string",
+   754→    collectsData: true,
+   755→    publishable: true,
+   756→    defaultLabel: "Date",
+   757→    defaultConfig: () => ({}),
+   758→    properties: [
+   759→      P_LABEL,
+   760→      P_DESCRIPTION,
+   761→      P_REQUIRED,
+   762→      P_WIDTH,
+   763→      P_HELP,
+   764→    ],
+   765→    validationNote:
+   766→      "Answers must be real calendar dates in YYYY-MM-DD form — enforced on every public submission (server-side).",
+   767→  },
+   768→
+   769→  {
+   770→    value: "time",
+   771→    label: "Time",
+   772→    icon: Clock,
+   773→    description: "A time of day picker (24-hour HH:MM).",
+   774→    status: "legacy",
+   775→    answerType: "string",
+   776→    collectsData: true,
+   777→    publishable: true,
+   778→    defaultLabel: "Time",
+   779→    defaultConfig: () => ({}),
+   780→    properties: [
+   781→      P_LABEL,
+   782→      P_DESCRIPTION,
+   783→      P_REQUIRED,
+   784→      P_WIDTH,
+   785→      P_HELP,
+   786→    ],
+   787→    validationNote:
+   788→      "Answers must be 24-hour HH:MM or HH:MM:SS times — enforced on every public submission (server-side).",
+   789→  },
+   790→
+   791→  {
+   792→    value: "scale",
+   793→    label: "Scale",
+   794→    icon: SlidersHorizontal,
+   795→    description: "Numbered scale (e.g. 1–10) with optional end labels.",
+   796→    status: "legacy",
+   797→    answerType: "number",
+   798→    collectsData: true,
+   799→    publishable: true,
+   800→    defaultLabel: "Scale",
+   801→    defaultConfig: () => ({}),
+   802→    properties: [
+   803→      P_LABEL,
+   804→      P_DESCRIPTION,
+   805→      P_REQUIRED,
+   806→      P_WIDTH,
+   807→      P_HELP,
+   808→      P_MIN,
+   809→      P_MAX,
+   810→      P_STEP,
+   811→      {
+   812→        key: "leftLabel",
+   813→        label: "Left label",
+   814→        section: "appearance",
+   815→        target: "config",
+   816→        control: "text",
+   817→        enforcement: "presentation",
+   818→        placeholder: "Not at all",
+   819→      },
+   820→      {
+   821→        key: "rightLabel",
+   822→        label: "Right label",
+   823→        section: "appearance",
+   824→        target: "config",
+   825→        control: "text",
+   826→        enforcement: "presentation",
+   827→        placeholder: "Absolutely",
+   828→      },
+   829→    ],
+   830→    validationNote:
+   831→      "Answers must land on a scale step — enforced on every public submission (server-side).",
+   832→  },
+   833→
+   834→  {
+   835→    value: "section",
+   836→    label: "Section",
+   837→    icon: Heading2,
+   838→    description: "A heading + description that organizes your form. Collects no data.",
+   839→    status: "legacy",
+   840→    answerType: "none",
+   841→    collectsData: false,
+   842→    publishable: true,
+   843→    defaultLabel: "Section",
+   844→    defaultConfig: () => ({}),
+   845→    properties: [
+   846→      P_LABEL,
+   847→      {
+   848→        ...P_DESCRIPTION,
+   849→        hint: "Shown under the section heading",
+   850→      },
+   851→      {
+   852→        key: "help_text",
+   853→        label: "Help text",
+   854→        section: "content",
+   855→        target: "column",
+   856→        control: "text",
+   857→        hint: "Smaller note under the description",
+   858→        placeholder: "Optional",
+   859→      },
+   860→    ],
+   861→  },
+   862→
+   863→  {
+   864→    value: "file_upload",
+   865→    label: "File upload",
+   866→    icon: Upload,
+   867→    description: "File picker with type/size limits. Cannot be published yet.",
+   868→    status: "legacy",
+   869→    answerType: "string",
+   870→    collectsData: true,
+   871→    publishable: false,
+   872→    defaultLabel: "File upload",
+   873→    defaultConfig: () => ({}),
+   874→    properties: [
+   875→      P_LABEL,
+   876→      P_DESCRIPTION,
+   877→      P_REQUIRED,
+   878→      P_WIDTH,
+   879→      P_HELP,
+   880→      {
+   881→        key: "allowedTypes",
+   882→        label: "Allowed types",
+   883→        section: "options",
+   884→        target: "config",
+   885→        control: "text",
+   886→        enforcement: "presentation",
+   887→        hint: "Comma-separated MIME types",
+   888→        placeholder: "image/png, application/pdf",
+   889→        fullWidth: true,
+   890→      },
+   891→      {
+   892→        key: "maxSizeMb",
+   893→        label: "Max size (MB)",
+   894→        section: "options",
+   895→        target: "config",
+   896→        control: "number",
+   897→        enforcement: "presentation",
+   898→        min: 1,
+   899→        max: 100,
+   900→      },
+   901→    ],
+   902→    validationNote:
+   903→      "Publishing a form with this field is blocked until anonymous file storage exists (a later phase).",
+   904→  },
+   905→];
+   906→
+   907→/* ------------------------------------------------------------------ */
+   908→/* Lookup helpers                                                      */
+   909→/* ------------------------------------------------------------------ */
+   910→
+   911→export function fieldDef(type: FieldType): FieldTypeDef {
+   912→  const def = FIELD_REGISTRY.find((t) => t.value === type);
+   913→  if (def) return def;
+   914→  // Unreachable while the registry covers the full DB enum; keep the
+   915→  // builder honest instead of crashing on future enum values.
+   916→  throw new Error(`Unknown field type: ${type}`);
+   917→}
+   918→
+   919→export function fieldDefSafe(type: FieldType): FieldTypeDef | undefined {
+   920→  return FIELD_REGISTRY.find((t) => t.value === type);
+   921→}
+   922→
+   923→/** Types offered in the field library (active only, in group order). */
+   924→export const ADDABLE_FIELD_TYPES: FieldTypeDef[] = FIELD_REGISTRY.filter(
+   925→  (t) => t.status === "active",
+   926→);
+   927→
+   928→export const FIELD_TYPES_BY_GROUP: Record<FieldGroup, FieldTypeDef[]> =
+   929→  FIELD_GROUPS.reduce(
+   930→    (acc, g) => {
+   931→      acc[g.key] = ADDABLE_FIELD_TYPES.filter((t) => t.group === g.key);
+   932→      return acc;
+   933→    },
+   934→    {} as Record<FieldGroup, FieldTypeDef[]>,
+   935→  );
+   936→
+   937→/* Compatibility aliases (existing call sites). */
+   938→export const fieldMeta = fieldDefSafe;
+   939→export function fieldLabel(type: FieldType): string {
+   940→  return fieldDefSafe(type)?.label ?? type;
+   941→}
+   942→export function defaultConfigForType(type: FieldType): Record<string, unknown> {
+   943→  return fieldDefSafe(type)?.defaultConfig() ?? {};
+   944→}
+   945→
+   946→/* ------------------------------------------------------------------ */
+   947→/* Config validation — mirrors 006 publish_form's checks so the       */
+   948→/* editor blocks invalid configs BEFORE they reach the database       */
+   949→/* ------------------------------------------------------------------ */
+   950→
+   951→export interface ConfigValidation {
+   952→  ok: boolean;
+   953→  message?: string;
+   954→}
+   955→
+   956→/**
+   957→ * A number 006 can round-trip: its numeric regex is
+   958→ * ^-?[0-9]{1,10}([.][0-9]{1,6})?$ — JS floats outside that range
+   959→ * (1e21, 1e-8) serialize exponentially and would be rejected at
+   960→ * publish time. Catch them here, honestly, up front.
+   961→ */
+   962→function isRepresentableNumber(v: unknown): boolean {
+   963→  if (typeof v !== "number" || !Number.isFinite(v)) return false;
+   964→  if (Math.abs(v) >= 1e10) return false;
+   965→  const s = String(v);
+   966→  if (s.includes("e") || s.includes("E")) return false;
+   967→  const decimals = s.includes(".") ? s.split(".")[1].length : 0;
+   968→  return decimals <= 6;
+   969→}
+   970→
+   971→function intInRange(v: unknown, min: number, max: number): boolean {
+   972→  return (
+   973→    typeof v === "number" && Number.isInteger(v) && v >= min && v <= max
+   974→  );
+   975→}
+   976→
+   977→/** Validate an option list (values + labels) for select-like fields. */
+   978→export function validateOptions(
+   979→  options: string[],
+   980→  labels: Record<string, string>,
+   981→): ConfigValidation {
+   982→  if (!Array.isArray(options) || options.length === 0) {
+   983→    return { ok: false, message: "Add at least one option." };
+   984→  }
+   985→  if (options.length > MAX_OPTIONS_PER_FIELD) {
+   986→    return {
+   987→      ok: false,
+   988→      message: `At most ${MAX_OPTIONS_PER_FIELD} options are allowed.`,
+   989→    };
+   990→  }
+   991→  const seen = new Set<string>();
+   992→  for (const v of options) {
+   993→    if (typeof v !== "string" || v.trim().length === 0) {
+   994→      return { ok: false, message: "Option values cannot be empty." };
+   995→    }
+   996→    if (v.length > MAX_OPTION_LEN) {
+   997→      return {
+   998→        ok: false,
+   999→        message: `Option values must be at most ${MAX_OPTION_LEN} characters.`,
+  1000→      };
+  1001→    }
+  1002→    if (seen.has(v)) {
+  1003→      return { ok: false, message: "Option values must be unique." };
+  1004→    }
+  1005→    seen.add(v);
+  1006→  }
+  1007→  for (const [value, label] of Object.entries(labels)) {
+  1008→    if (typeof label !== "string") continue;
+  1009→    if (label.length > MAX_PRESENTATION_LEN) {
+  1010→      return {
+  1011→        ok: false,
+  1012→        message: `Option labels must be at most ${MAX_PRESENTATION_LEN} characters.`,
+  1013→      };
+  1014→    }
+  1015→    if (!options.includes(value) && label.trim() !== "") {
+  1016→      // Stale label entry — harmless at render (never looked up), but
+  1017→      // keep configs clean.
+  1018→      return { ok: false, message: "An option label has no matching value." };
+  1019→    }
+  1020→  }
+  1021→  return { ok: true };
+  1022→}
+  1023→
+  1024→/**
+  1025→ * Validate a full config object for a type before writing it to the
+  1026→ * database. Mirrors publish_form() so nothing valid here can fail
+  1027→ * there, and nothing invalid here can silently pass there.
+  1028→ */
+  1029→export function validateConfig(
+  1030→  type: FieldType,
+  1031→  config: Record<string, unknown>,
+  1032→): ConfigValidation {
+  1033→  switch (type) {
+  1034→    case "short_text":
+  1035→    case "long_text":
+  1036→    case "email":
+  1037→    case "url":
+  1038→    case "phone": {
+  1039→      const minL = config.minLength;
+  1040→      const maxL = config.maxLength;
+  1041→      if (
+  1042→        minL != null &&
+  1043→        (!intInRange(minL, 0, MAX_LENGTH_CFG))
+  1044→      ) {
+  1045→        return {
+  1046→          ok: false,
+  1047→          message: `Min length must be a whole number between 0 and ${MAX_LENGTH_CFG}.`,
+  1048→        };
+  1049→      }
+  1050→      if (maxL != null && !intInRange(maxL, 1, MAX_LENGTH_CFG)) {
+  1051→        return {
+  1052→          ok: false,
+  1053→          message: `Max length must be a whole number between 1 and ${MAX_LENGTH_CFG}.`,
+  1054→        };
+  1055→      }
+  1056→      if (minL != null && maxL != null && Number(minL) > Number(maxL)) {
+  1057→        return { ok: false, message: "Min length cannot exceed max length." };
+  1058→      }
+  1059→      if (type === "short_text" && typeof config.pattern === "string" && config.pattern) {
+  1060→        if (config.pattern.length > MAX_PATTERN_LEN) {
+  1061→          return {
+  1062→            ok: false,
+  1063→            message: `Pattern must be at most ${MAX_PATTERN_LEN} characters.`,
+  1064→          };
+  1065→        }
+  1066→        try {
+  1067→          new RegExp(config.pattern);
+  1068→        } catch {
+  1069→          return { ok: false, message: "Pattern is not a valid regular expression." };
+  1070→        }
+  1071→      }
+  1072→      if (type === "phone" && config.defaultCountry != null) {
+  1073→        if (typeof config.defaultCountry !== "string" || !/^[A-Z]{2}$/.test(config.defaultCountry)) {
+  1074→          return { ok: false, message: "Default country must be a 2-letter code." };
+  1075→        }
+  1076→      }
+  1077→      return { ok: true };
+  1078→    }
+  1079→
+  1080→    case "number":
+  1081→    case "decimal":
+  1082→    case "scale": {
+  1083→      const { min, max, step } = config;
+  1084→      if (min != null && !isRepresentableNumber(min)) {
+  1085→        return { ok: false, message: "Min must be a number (up to 10 digits, 6 decimals)." };
+  1086→      }
+  1087→      if (max != null && !isRepresentableNumber(max)) {
+  1088→        return { ok: false, message: "Max must be a number (up to 10 digits, 6 decimals)." };
+  1089→      }
+  1090→      if (step != null && (!isRepresentableNumber(step) || Number(step) <= 0)) {
+  1091→        return { ok: false, message: "Step must be greater than 0 (up to 6 decimals)." };
+  1092→      }
+  1093→      if (min != null && max != null && Number(min) >= Number(max)) {
+  1094→        return { ok: false, message: "Min must be less than max." };
+  1095→      }
+  1096→      if (type === "decimal" && config.precision != null) {
+  1097→        if (!intInRange(config.precision, 0, 6)) {
+  1098→          return { ok: false, message: "Precision must be a whole number between 0 and 6." };
+  1099→        }
+  1100→      }
+  1101→      if (type === "scale") {
+  1102→        for (const k of ["leftLabel", "rightLabel"] as const) {
+  1103→          const v = config[k];
+  1104→          if (typeof v === "string" && v.length > MAX_END_LABEL_LEN) {
+  1105→            return {
+  1106→              ok: false,
+  1107→              message: `${k === "leftLabel" ? "Left" : "Right"} label must be at most ${MAX_END_LABEL_LEN} characters.`,
+  1108→            };
+  1109→          }
+  1110→        }
+  1111→      }
+  1112→      return { ok: true };
+  1113→    }
+  1114→
+  1115→    case "single_select":
+  1116→    case "multi_select": {
+  1117→      const options = Array.isArray(config.options)
+  1118→        ? (config.options as unknown[])
+  1119→        : [];
+  1120→      const labels =
+  1121→        config.optionLabels && typeof config.optionLabels === "object"
+  1122→          ? (config.optionLabels as Record<string, string>)
+  1123→          : {};
+  1124→      const allStrings = options.every((o) => typeof o === "string");
+  1125→      if (!allStrings) {
+  1126→        return { ok: false, message: "Option values must be plain strings." };
+  1127→      }
+  1128→      return validateOptions(options as string[], labels);
+  1129→    }
+  1130→
+  1131→    case "rating": {
+  1132→      const max = config.max;
+  1133→      if (max != null && !intInRange(max, 2, 10)) {
+  1134→        return { ok: false, message: "Scale must be a whole number between 2 and 10." };
+  1135→      }
+  1136→      const symbol = config.symbol;
+  1137→      if (
+  1138→        symbol != null &&
+  1139→        !["star", "heart", "thumb", "circle"].includes(String(symbol))
+  1140→      ) {
+  1141→        return { ok: false, message: "Unknown rating symbol." };
+  1142→      }
+  1143→      for (const k of ["leftLabel", "rightLabel"] as const) {
+  1144→        const v = config[k];
+  1145→        if (typeof v === "string" && v.length > MAX_END_LABEL_LEN) {
+  1146→          return {
+  1147→            ok: false,
+  1148→            message: `${k === "leftLabel" ? "Left" : "Right"} label must be at most ${MAX_END_LABEL_LEN} characters.`,
+  1149→          };
+  1150→        }
+  1151→      }
+  1152→      return { ok: true };
+  1153→    }
+  1154→
+  1155→    case "file_upload": {
+  1156→      const maxSizeMb = config.maxSizeMb;
+  1157→      if (
+  1158→        maxSizeMb != null &&
+  1159→        (!Number.isFinite(Number(maxSizeMb)) ||
+  1160→          Number(maxSizeMb) <= 0 ||
+  1161→          Number(maxSizeMb) > 100)
+  1162→      ) {
+  1163→        return { ok: false, message: "Max size must be between 0 and 100 MB." };
+  1164→      }
+  1165→      const allowedTypes = config.allowedTypes;
+  1166→      if (
+  1167→        allowedTypes != null &&
+  1168→        (!Array.isArray(allowedTypes) ||
+  1169→          allowedTypes.some((t) => typeof t !== "string"))
+  1170→      ) {
+  1171→        return { ok: false, message: "Allowed types must be a list of strings." };
+  1172→      }
+  1173→      return { ok: true };
+  1174→    }
+  1175→
+  1176→    default:
+  1177→      return { ok: true };
+  1178→  }
+  1179→}
+  1180→
+  1181→/** Width is validated separately — the DB CHECK is 1..12. */
+  1182→export function validateWidth(width: number): ConfigValidation {
+  1183→  if (!Number.isInteger(width) || width < 1 || width > 12) {
+  1184→    return { ok: false, message: "Width must be between 1 and 12." };
+  1185→  }
+  1186→  return { ok: true };
+  1187→}
+  1188→

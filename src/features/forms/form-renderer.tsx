@@ -46,9 +46,59 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Star, Upload, Info } from "lucide-react";
+import { Star, Heart, ThumbsUp, Circle, Upload, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Database, FieldType } from "@/lib/supabase/types";
+import { PhoneControl } from "./phone-control";
+
+/* ------------------------------------------------------------------ */
+/* Option labels (Field System 2.0) — config.optionLabels maps a      */
+/* stable option VALUE to its display label. Values live in the      */
+/* 006-validated `options` array; labels are presentation-only and   */
+/* flow through the publish snapshot to the public form. Missing or  */
+/* empty labels fall back to the value itself, so pre-rebuild fields */
+/* (label === value) render identically.                              */
+/* ------------------------------------------------------------------ */
+
+export function optionLabelFor(
+  config: Record<string, unknown>,
+  value: string,
+): string {
+  const labels = config.optionLabels;
+  if (labels && typeof labels === "object" && !Array.isArray(labels)) {
+    const l = (labels as Record<string, unknown>)[value];
+    if (typeof l === "string" && l.trim() !== "") return l;
+  }
+  return value;
+}
+
+/** Rating symbols — presentation-only config (config.symbol). */
+const RATING_SYMBOLS = {
+  star: Star,
+  heart: Heart,
+  thumb: ThumbsUp,
+  circle: Circle,
+} as const;
+
+export type RatingSymbol = keyof typeof RATING_SYMBOLS;
+
+export function ratingSymbolOf(config: Record<string, unknown>): RatingSymbol {
+  const s = config.symbol;
+  return typeof s === "string" && s in RATING_SYMBOLS ? (s as RatingSymbol) : "star";
+}
+
+/** Decimal places in a JS number, robust to exponential notation. */
+function countDecimals(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  const s = String(n);
+  if (s.includes("e-") || s.includes("E-")) {
+    const [m, e] = s.toLowerCase().split("e-");
+    const mantissa = m.includes(".") ? m.split(".")[1].length : 0;
+    return mantissa + Number(e);
+  }
+  if (s.includes(".")) return s.split(".")[1].length;
+  return 0;
+}
 
 /* ------------------------------------------------------------------ */
 /* Renderable model (006 snapshot contract)                            */
@@ -200,8 +250,17 @@ export function validateFieldValue(
       if (t === "url" && (!/^https?:\/\//.test(value) || /\s/.test(value))) {
         return "Enter a valid URL (starting with http:// or https://).";
       }
-      if (t === "phone" && !/^[+]?[0-9(). -]{5,25}$/.test(value)) {
-        return "Enter a valid phone number (5-25 characters, digits and + ( ) . -).";
+      if (t === "phone") {
+        if (!/^[+]?[0-9(). -]{5,25}$/.test(value)) {
+          return "Enter a valid phone number (5-25 characters, digits and + ( ) . -).";
+        }
+        // Client-side UX tightening (same class as the required-checkbox
+        // rule): E.164 bounds — 4 to 15 digits total. The server's regex
+        // is the backstop, not the ceiling; documented, not invented.
+        const digitCount = (value.match(/\d/g) ?? []).length;
+        if (digitCount < 4 || digitCount > 15) {
+          return "Enter a valid phone number (4 to 15 digits).";
+        }
       }
       if (t === "short_text" && typeof config.pattern === "string" && config.pattern) {
         try {
@@ -232,6 +291,17 @@ export function validateFieldValue(
           }
         } else if (!isStepAligned(value, 0, step)) {
           return `Answer must be a multiple of ${step}.`;
+        }
+      }
+      // Precision (config.precision) — client-side, declared as such in
+      // the registry; limits how many decimals a respondent may enter.
+      if (t === "decimal") {
+        const p = num(config.precision);
+        if (
+          p !== undefined && Number.isInteger(p) && p >= 0 && p <= 6 &&
+          countDecimals(value) > p
+        ) {
+          return `Answer can have at most ${p} decimal place${p === 1 ? "" : "s"}.`;
         }
       }
       return null;
@@ -368,16 +438,27 @@ export function FieldControl({
 
     case "email":
     case "url":
-    case "phone":
       return (
         <Input
           id={id}
-          type={t === "email" ? "email" : t === "url" ? "url" : "tel"}
+          type={t === "email" ? "email" : "url"}
           value={typeof value === "string" ? value : ""}
           onChange={(e) => onChange(e.target.value)}
           placeholder={field.placeholder ?? undefined}
           disabled={disabled}
-          maxLength={t === "email" ? CAPS.email : t === "url" ? CAPS.url : CAPS.phone}
+          maxLength={t === "email" ? CAPS.email : CAPS.url}
+        />
+      );
+
+    case "phone":
+      return (
+        <PhoneControl
+          id={id}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          placeholder={field.placeholder}
+          defaultCountry={cfg.defaultCountry}
         />
       );
 
@@ -470,11 +551,14 @@ export function FieldControl({
             <SelectValue placeholder={field.placeholder ?? "Choose an option"} />
           </SelectTrigger>
           <SelectContent>
-            {options.map((o) => (
-              <SelectItem key={String(o)} value={String(o)}>
-                {String(o)}
-              </SelectItem>
-            ))}
+            {options.map((o) => {
+              const v = String(o);
+              return (
+                <SelectItem key={v} value={v}>
+                  {optionLabelFor(cfg, v)}
+                </SelectItem>
+              );
+            })}
           </SelectContent>
         </Select>
       );
@@ -500,9 +584,9 @@ export function FieldControl({
                     onChange(v === true ? [...selected, opt] : selected.filter((s) => s !== opt));
                   }}
                   disabled={disabled}
-                  aria-label={opt}
+                  aria-label={optionLabelFor(cfg, opt)}
                 />
-                <span>{opt}</span>
+                <span>{optionLabelFor(cfg, opt)}</span>
               </label>
             );
           })}
@@ -515,29 +599,40 @@ export function FieldControl({
         const m = typeof cfg.max === "number" ? cfg.max : 5;
         return m >= 2 && m <= 10 && Number.isInteger(m) ? Math.round(m) : 5;
       })();
+      const SymbolIcon = RATING_SYMBOLS[ratingSymbolOf(cfg)];
+      const leftLabel = typeof cfg.leftLabel === "string" ? cfg.leftLabel : null;
+      const rightLabel = typeof cfg.rightLabel === "string" ? cfg.rightLabel : null;
       const current = typeof value === "number" ? value : 0;
       return (
-        <div className="flex items-center gap-1 pt-1" role="group" aria-label={field.label}>
-          {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() => onChange(n === current ? undefined : n)}
-              disabled={disabled}
-              aria-label={`Rate ${n} out of ${max}`}
-              aria-pressed={current === n}
-              className={cn(
-                "rounded-md p-1 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
-                n <= current ? "text-[color:var(--memphis-sun)]" : "text-muted-foreground/30",
-              )}
-            >
-              <Star className={cn("h-6 w-6", n <= current && "fill-current")} />
-            </button>
-          ))}
-          {current > 0 && (
-            <span className="ml-2 text-sm font-semibold text-muted-foreground" aria-live="polite">
-              {current}/{max}
-            </span>
+        <div className="space-y-1.5 pt-1">
+          <div className="flex items-center gap-1" role="group" aria-label={field.label}>
+            {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+              <button
+                key={n}
+                type="button"
+                onClick={() => onChange(n === current ? undefined : n)}
+                disabled={disabled}
+                aria-label={`Rate ${n} out of ${max}`}
+                aria-pressed={current === n}
+                className={cn(
+                  "rounded-md p-1 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+                  n <= current ? "text-[color:var(--memphis-sun)]" : "text-muted-foreground/30",
+                )}
+              >
+                <SymbolIcon className={cn("h-6 w-6", n <= current && "fill-current")} />
+              </button>
+            ))}
+            {current > 0 && (
+              <span className="ml-2 text-sm font-semibold text-muted-foreground" aria-live="polite">
+                {current}/{max}
+              </span>
+            )}
+          </div>
+          {(leftLabel || rightLabel) && (
+            <div className="flex justify-between text-xs text-muted-foreground">
+              <span>{leftLabel}</span>
+              <span>{rightLabel}</span>
+            </div>
           )}
         </div>
       );

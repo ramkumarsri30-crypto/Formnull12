@@ -1,0 +1,1660 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * FormNull — Form Builder (Phase 3)
+     5→ * =====================================================================
+     6→ * THE manual form builder — the product's core surface. Professional
+     7→ * 3-pane layout, Memphis-designed:
+     8→ *
+     9→ *   ┌────────────────────────────────────────────────────────────┐
+    10→ *   │ toolbar: back · status · name · save-state · preview ·     │
+    11→ *   │          publish · share · more                            │
+    12→ *   ├───────────┬───────────────────────────┬────────────────────┤
+    13→ *   │ field     │ live form canvas          │ properties         │
+    14→ *   │ library   │ (what respondents see)    │ (form / field)     │
+    15→ *   └───────────┴───────────────────────────┴────────────────────┘
+    16→ *
+    17→ * Tablet/mobile (< lg): canvas full-width; the field library and the
+    18→ * properties panel become Sheets. Nothing is unreachable.
+    19→ *
+    20→ * Real Supabase persistence (unchanged contracts from Phase 2A):
+    21→ *   - Form load:      SELECT forms + form_fields (sorted by sort_order)
+    22→ *   - Form save:      UPDATE forms (name, description, settings)
+    23→ *   - Form delete:    DELETE forms (cascades fields + submissions)
+    24→ *   - Add field:      INSERT form_fields (immediate, sort_order = max+1)
+    25→ *   - Edit field:     UPDATE form_fields (explicit Save per field)
+    26→ *   - Duplicate:      INSERT form_fields (config copy, unique key)
+    27→ *   - Delete field:   DELETE form_fields (006 keeps collected answers:
+    28→ *                     submission_values.field_id → ON DELETE SET NULL)
+    29→ *   - Reorder:        UPDATE sort_order for changed rows only, once
+    30→ *                     per drop / button press, with rollback.
+    31→ *   - Publish:        RPC publish_form (migration 006 — immutable
+    32→ *                     version snapshot + public link flip).
+    33→ *
+    34→ * No fake success: every mutation awaits the real Supabase response
+    35→ * and only updates UI state after the database confirms. Failures
+    36→ * surface real errors and preserve unsaved local work — selection
+    37→ * changes and unload are guarded while edits are pending.
+    38→ *
+    39→ * RLS: all queries run as the authenticated user — readers must be
+    40→ * workspace members, writers editors+. An unauthorized form id simply
+    41→ * returns no row ("Form not found"). publish_form re-checks editor
+    42→ * rights server-side (SECURITY DEFINER) — the button being visible
+    43→ * is never the permission boundary.
+    44→ */
+    45→import { useCallback, useEffect, useMemo, useState } from "react";
+    46→import Link from "next/link";
+    47→import { useRouter } from "next/navigation";
+    48→import { toast } from "sonner";
+    49→import {
+    50→  DndContext,
+    51→  closestCenter,
+    52→  PointerSensor,
+    53→  TouchSensor,
+    54→  useSensor,
+    55→  useSensors,
+    56→  type DragEndEvent,
+    57→} from "@dnd-kit/core";
+    58→import {
+    59→  SortableContext,
+    60→  verticalListSortingStrategy,
+    61→  useSortable,
+    62→  arrayMove,
+    63→} from "@dnd-kit/sortable";
+    64→import { CSS } from "@dnd-kit/utilities";
+    65→import { Button } from "@/components/ui/button";
+    66→import { Input } from "@/components/ui/input";
+    67→import { Label } from "@/components/ui/label";
+    68→import { Textarea } from "@/components/ui/textarea";
+    69→import {
+    70→  EmptyState,
+    71→  ErrorState,
+    72→  LoadingState,
+    73→} from "@/components/formnull/states";
+    74→import {
+    75→  AlertDialog,
+    76→  AlertDialogAction,
+    77→  AlertDialogCancel,
+    78→  AlertDialogContent,
+    79→  AlertDialogDescription,
+    80→  AlertDialogFooter,
+    81→  AlertDialogHeader,
+    82→  AlertDialogTitle,
+    83→} from "@/components/ui/alert-dialog";
+    84→import {
+    85→  DropdownMenu,
+    86→  DropdownMenuContent,
+    87→  DropdownMenuItem,
+    88→  DropdownMenuTrigger,
+    89→} from "@/components/ui/dropdown-menu";
+    90→import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+    91→import { GeometricCircle, GeometricTriangle } from "@/components/memphis/memphis-decorations";
+    92→import { supabaseBrowser } from "@/lib/supabase/client";
+    93→import type { Database } from "@/lib/supabase/types";
+    94→import { useMediaQuery } from "@/hooks/use-mobile";
+    95→import {
+    96→  ArrowLeft,
+    97→  Trash2,
+    98→  FileText,
+    99→  ChevronUp,
+   100→  ChevronDown,
+   101→  GripVertical,
+   102→  Copy,
+   103→  Eye,
+   104→  Rocket,
+   105→  Share2,
+   106→  MoreHorizontal,
+   107→  Plus,
+   108→  X,
+   109→  TriangleAlert,
+   110→  Check,
+   111→  Loader2,
+   112→} from "lucide-react";
+   113→import { cn } from "@/lib/utils";
+   114→import {
+   115→  fieldMeta,
+   116→  fieldLabel,
+   117→  defaultConfigForType,
+   118→  MAX_FIELDS_PER_FORM,
+   119→  FIELD_LIMIT_WARN_AT,
+   120→  type FieldType,
+   121→} from "./field-types";
+   122→import { FieldEditor } from "./field-editor";
+   123→import { FieldLibrary } from "./field-library";
+   124→import { FieldLabelBlock, FieldControl, toRenderableField } from "./form-renderer";
+   125→import { PreviewDialog } from "./preview-dialog";
+   126→import { PublishDialog, ShareDialog } from "./publish-dialog";
+   127→import { useAuth } from "@/features/auth/auth-provider";
+   128→
+   129→type FormRow = Database["public"]["Tables"]["forms"]["Row"];
+   130→type FormField = Database["public"]["Tables"]["form_fields"]["Row"];
+   131→
+   132→/* ------------------------------------------------------------------ */
+   133→/* field_key generation — unique per form                              */
+   134→/* ------------------------------------------------------------------ */
+   135→
+   136→function slugify(s: string): string {
+   137→  return (
+   138→    s
+   139→      .toLowerCase()
+   140→      .trim()
+   141→      .replace(/[^a-z0-9]+/g, "_")
+   142→      .replace(/^_+|_+$/g, "")
+   143→      .slice(0, 50) || "field"
+   144→  );
+   145→}
+   146→
+   147→function uniqueKey(base: string, existing: string[]): string {
+   148→  const b = slugify(base);
+   149→  if (!existing.includes(b)) return b;
+   150→  let i = 2;
+   151→  while (existing.includes(`${b}_${i}`)) i += 1;
+   152→  return `${b}_${i}`;
+   153→}
+   154→
+   155→function statusColor(status: string): string {
+   156→  switch (status) {
+   157→    case "published":
+   158→      return "var(--memphis-mint)";
+   159→    case "paused":
+   160→      return "var(--memphis-sun)";
+   161→    case "archived":
+   162→      return "var(--muted-foreground)";
+   163→    default:
+   164→      return "var(--memphis-coral)";
+   165→  }
+   166→}
+   167→
+   168→/* ------------------------------------------------------------------ */
+   169→/* FormDetail (builder)                                                */
+   170→/* ------------------------------------------------------------------ */
+   171→
+   172→export function FormDetail({ formId }: { formId: string }) {
+   173→  const router = useRouter();
+   174→  const { user } = useAuth();
+   175→  const isDesktop = useMediaQuery("(min-width: 1024px)");
+   176→
+   177→  const [form, setForm] = useState<FormRow | null>(null);
+   178→  const [fields, setFields] = useState<FormField[]>([]);
+   179→  const [loading, setLoading] = useState(true);
+   180→  const [loadError, setLoadError] = useState<string | null>(null);
+   181→
+   182→  // Form-level editing (parent-held so panel switching never loses drafts)
+   183→  const [name, setName] = useState("");
+   184→  const [description, setDescription] = useState("");
+   185→  const [submitLabel, setSubmitLabel] = useState("");
+   186→  const [savingForm, setSavingForm] = useState(false);
+   187→  const [deletingForm, setDeletingForm] = useState(false);
+   188→
+   189→  // Field-level editing
+   190→  const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
+   191→  const [editorDirty, setEditorDirty] = useState(false);
+   192→  const [savingFieldId, setSavingFieldId] = useState<string | null>(null);
+   193→  const [addingField, setAddingField] = useState<FieldType | null>(null);
+   194→  const [duplicatingFieldId, setDuplicatingFieldId] = useState<string | null>(null);
+   195→  const [reorderError, setReorderError] = useState<string | null>(null);
+   196→
+   197→  // Dialogs / sheets
+   198→  const [previewOpen, setPreviewOpen] = useState(false);
+   199→  const [publishOpen, setPublishOpen] = useState(false);
+   200→  const [shareOpen, setShareOpen] = useState(false);
+   201→  const [deleteFormOpen, setDeleteFormOpen] = useState(false);
+   202→  const [deleteFieldTarget, setDeleteFieldTarget] = useState<FormField | null>(null);
+   203→  const [deleteFieldBusy, setDeleteFieldBusy] = useState(false);
+   204→  const [discardOpen, setDiscardOpen] = useState(false);
+   205→  const [pendingSelection, setPendingSelection] = useState<string | null | "cancel">(null);
+   206→  const [librarySheetOpen, setLibrarySheetOpen] = useState(false);
+   207→  const [propsSheetOpen, setPropsSheetOpen] = useState(false);
+   208→
+   209→  const fieldIds = useMemo(() => fields.map((f) => f.id), [fields]);
+   210→  const selectedField = useMemo(
+   211→    () => fields.find((f) => f.id === selectedFieldId) ?? null,
+   212→    [fields, selectedFieldId],
+   213→  );
+   214→  const savedSubmitLabel =
+   215→    typeof form?.settings?.submit_button_label === "string"
+   216→      ? (form.settings.submit_button_label as string)
+   217→      : "";
+   218→  const formDetailsDirty =
+   219→    form !== null &&
+   220→    (name !== form.name ||
+   221→      (description || "") !== (form.description ?? "") ||
+   222→      submitLabel !== savedSubmitLabel);
+   223→  const hasFileUpload = fields.some((f) => f.field_type === "file_upload");
+   224→
+   225→  const load = useCallback(async () => {
+   226→    setLoading(true);
+   227→    setLoadError(null);
+   228→    try {
+   229→      const [formRes, fieldsRes] = await Promise.all([
+   230→        supabaseBrowser.from("forms").select("*").eq("id", formId).maybeSingle(),
+   231→        supabaseBrowser
+   232→          .from("form_fields")
+   233→          .select("*")
+   234→          .eq("form_id", formId)
+   235→          .order("sort_order", { ascending: true }),
+   236→      ]);
+   237→
+   238→      if (formRes.error) throw formRes.error;
+   239→      if (!formRes.data) {
+   240→        setForm(null);
+   241→        setLoadError("Form not found, or you don't have access to it.");
+   242→        setLoading(false);
+   243→        return;
+   244→      }
+   245→      setForm(formRes.data);
+   246→      setName(formRes.data.name);
+   247→      setDescription(formRes.data.description ?? "");
+   248→      setSubmitLabel(
+   249→        typeof formRes.data.settings?.submit_button_label === "string"
+   250→          ? (formRes.data.settings.submit_button_label as string)
+   251→          : "",
+   252→      );
+   253→
+   254→      if (fieldsRes.error) throw fieldsRes.error;
+   255→      setFields((fieldsRes.data as FormField[]) ?? []);
+   256→    } catch (e) {
+   257→      const msg = e instanceof Error ? e.message : "Failed to load form.";
+   258→      setLoadError(msg);
+   259→    } finally {
+   260→      setLoading(false);
+   261→    }
+   262→  }, [formId]);
+   263→
+   264→  useEffect(() => {
+   265→    load();
+   266→  }, [load]);
+   267→
+   268→  /* ------------ Unload guard — no silent data loss ------------ */
+   269→  useEffect(() => {
+   270→    const handler = (e: BeforeUnloadEvent) => {
+   271→      if (formDetailsDirty || editorDirty) {
+   272→        e.preventDefault();
+   273→        e.returnValue = "";
+   274→      }
+   275→    };
+   276→    window.addEventListener("beforeunload", handler);
+   277→    return () => window.removeEventListener("beforeunload", handler);
+   278→  }, [formDetailsDirty, editorDirty]);
+   279→
+   280→  /* ---------------- Selection (with dirty guard) ---------------- */
+   281→
+   282→  function selectField(id: string | null) {
+   283→    if (editorDirty && id !== selectedFieldId) {
+   284→      setPendingSelection(id);
+   285→      setDiscardOpen(true);
+   286→      return;
+   287→    }
+   288→    setSelectedFieldId(id);
+   289→    if (id !== null && !isDesktop) setPropsSheetOpen(true);
+   290→  }
+   291→
+   292→  function closeProperties() {
+   293→    if (editorDirty) {
+   294→      setPendingSelection("cancel");
+   295→      setDiscardOpen(true);
+   296→      return;
+   297→    }
+   298→    setSelectedFieldId(null);
+   299→    setPropsSheetOpen(false);
+   300→  }
+   301→
+   302→  function confirmDiscard() {
+   303→    setEditorDirty(false);
+   304→    if (pendingSelection === "cancel" || pendingSelection === null) {
+   305→      setSelectedFieldId(null);
+   306→      setPropsSheetOpen(false);
+   307→    } else {
+   308→      setSelectedFieldId(pendingSelection);
+   309→      if (!isDesktop) setPropsSheetOpen(true);
+   310→    }
+   311→    setPendingSelection(null);
+   312→    setDiscardOpen(false);
+   313→  }
+   314→
+   315→  /* ---------------- Form-level mutations ---------------- */
+   316→
+   317→  async function saveForm() {
+   318→    if (!form) return;
+   319→    if (!name.trim()) {
+   320→      toast.error("Form name cannot be empty.");
+   321→      return;
+   322→    }
+   323→    if (!user) {
+   324→      toast.error("Your session has expired. Please sign in again.");
+   325→      return;
+   326→    }
+   327→    setSavingForm(true);
+   328→    const nextSettings: Record<string, unknown> = { ...(form.settings ?? {}) };
+   329→    const trimmedLabel = submitLabel.trim().slice(0, 40);
+   330→    if (trimmedLabel) nextSettings.submit_button_label = trimmedLabel;
+   331→    else delete nextSettings.submit_button_label;
+   332→
+   333→    const { error } = await supabaseBrowser
+   334→      .from("forms")
+   335→      .update({
+   336→        name: name.trim(),
+   337→        description: description.trim() || null,
+   338→        settings: nextSettings,
+   339→        updated_by: user.id,
+   340→      })
+   341→      .eq("id", form.id);
+   342→    setSavingForm(false);
+   343→    if (error) {
+   344→      toast.error("Could not save form.", { description: error.message });
+   345→      return;
+   346→    }
+   347→    toast.success("Form updated.");
+   348→    setForm({
+   349→      ...form,
+   350→      name: name.trim(),
+   351→      description: description.trim() || null,
+   352→      settings: nextSettings,
+   353→      updated_by: user.id,
+   354→    });
+   355→  }
+   356→
+   357→  async function deleteForm() {
+   358→    if (!form) return;
+   359→    setDeletingForm(true);
+   360→    const { error } = await supabaseBrowser.from("forms").delete().eq("id", form.id);
+   361→    setDeletingForm(false);
+   362→    if (error) {
+   363→      toast.error("Could not delete form.", { description: error.message });
+   364→      return;
+   365→    }
+   366→    toast.success("Form deleted.");
+   367→    router.push("/dashboard/forms/");
+   368→    router.refresh();
+   369→  }
+   370→
+   371→  /* ---------------- Field mutations ---------------- */
+   372→
+   373→  async function addField(type: FieldType) {
+   374→    if (!form) return;
+   375→    if (fields.length >= MAX_FIELDS_PER_FORM) {
+   376→      toast.error("Field limit reached.", {
+   377→        description: `A form supports at most ${MAX_FIELDS_PER_FORM} fields (matching the publish limit).`,
+   378→      });
+   379→      return;
+   380→    }
+   381→    const meta = { type, label: fieldLabel(type) };
+   382→    setAddingField(type);
+   383→    try {
+   384→      const existingKeys = fields.map((f) => f.field_key);
+   385→      const key = uniqueKey(meta.label, existingKeys);
+   386→      const nextOrder =
+   387→        fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
+   388→
+   389→      // Type-appropriate default config from the CENTRALIZED registry
+   390→      // (selects start with valid options, ratings with max=5).
+   391→      const defaultConfig = defaultConfigForType(type);
+   392→
+   393→      const { data, error } = await supabaseBrowser
+   394→        .from("form_fields")
+   395→        .insert({
+   396→          form_id: form.id,
+   397→          field_key: key,
+   398→          field_type: type,
+   399→          label: meta.label,
+   400→          is_required: false,
+   401→          sort_order: nextOrder,
+   402→          width: 12,
+   403→          config: defaultConfig,
+   404→        })
+   405→        .select()
+   406→        .single();
+   407→
+   408→      if (error) throw error;
+   409→      if (!data) throw new Error("Field creation returned no row.");
+   410→
+   411→      // Real row confirmed by the database — now update the UI.
+   412→      setFields((prev) => [...prev, data as FormField]);
+   413→      selectField(data.id);
+   414→      if (!isDesktop) setLibrarySheetOpen(false);
+   415→      toast.success(`${meta.label} field added.`);
+   416→      // Bring the new card into view (data-attr lookup — no ref plumbing).
+   417→      window.requestAnimationFrame(() => {
+   418→        document
+   419→          .querySelector(`[data-field-id="${data.id}"]`)
+   420→          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+   421→      });
+   422→    } catch (e) {
+   423→      toast.error("Could not add field.", {
+   424→        description: e instanceof Error ? e.message : "Please try again.",
+   425→      });
+   426→    } finally {
+   427→      setAddingField(null);
+   428→    }
+   429→  }
+   430→
+   431→  async function saveField(
+   432→    fieldId: string,
+   433→    draft: {
+   434→      label: string;
+   435→      description: string | null;
+   436→      placeholder: string | null;
+   437→      help_text: string | null;
+   438→      is_required: boolean;
+   439→      width: number;
+   440→      config: Record<string, unknown>;
+   441→    },
+   442→  ): Promise<boolean> {
+   443→    setSavingFieldId(fieldId);
+   444→    const { error } = await supabaseBrowser
+   445→      .from("form_fields")
+   446→      .update({
+   447→        label: draft.label,
+   448→        description: draft.description,
+   449→        placeholder: draft.placeholder,
+   450→        help_text: draft.help_text,
+   451→        is_required: draft.is_required,
+   452→        width: draft.width,
+   453→        config: draft.config,
+   454→      })
+   455→      .eq("id", fieldId);
+   456→    setSavingFieldId(null);
+   457→    if (error) {
+   458→      toast.error("Could not save field.", { description: error.message });
+   459→      return false;
+   460→    }
+   461→    setFields((prev) => prev.map((f) => (f.id === fieldId ? { ...f, ...draft } : f)));
+   462→    toast.success("Field saved.");
+   463→    return true;
+   464→  }
+   465→
+   466→  async function duplicateField(field: FormField) {
+   467→    if (!form) return;
+   468→    if (fields.length >= MAX_FIELDS_PER_FORM) {
+   469→      toast.error("Field limit reached.", {
+   470→        description: `A form supports at most ${MAX_FIELDS_PER_FORM} fields.`,
+   471→      });
+   472→      return;
+   473→    }
+   474→    setDuplicatingFieldId(field.id);
+   475→    try {
+   476→      const existingKeys = fields.map((f) => f.field_key);
+   477→      const key = uniqueKey(field.field_key, existingKeys);
+   478→      const nextOrder =
+   479→        fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
+   480→
+   481→      const { data, error } = await supabaseBrowser
+   482→        .from("form_fields")
+   483→        .insert({
+   484→          form_id: form.id,
+   485→          field_key: key,
+   486→          field_type: field.field_type,
+   487→          label: `${field.label} (copy)`,
+   488→          description: field.description,
+   489→          placeholder: field.placeholder,
+   490→          help_text: field.help_text,
+   491→          is_required: field.is_required,
+   492→          width: field.width,
+   493→          sort_order: nextOrder,
+   494→          config: { ...(field.config ?? {}) },
+   495→        })
+   496→        .select()
+   497→        .single();
+   498→
+   499→      if (error) throw error;
+   500→      if (!data) throw new Error("Duplication returned no row.");
+   501→
+   502→      setFields((prev) => [...prev, data as FormField]);
+   503→      selectField(data.id);
+   504→      toast.success("Field duplicated.");
+   505→      window.requestAnimationFrame(() => {
+   506→        document
+   507→          .querySelector(`[data-field-id="${data.id}"]`)
+   508→          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+   509→      });
+   510→    } catch (e) {
+   511→      toast.error("Could not duplicate field.", {
+   512→        description: e instanceof Error ? e.message : "Please try again.",
+   513→      });
+   514→    } finally {
+   515→      setDuplicatingFieldId(null);
+   516→    }
+   517→  }
+   518→
+   519→  async function deleteField(target: FormField) {
+   520→    setDeleteFieldBusy(true);
+   521→    const { error } = await supabaseBrowser
+   522→      .from("form_fields")
+   523→      .delete()
+   524→      .eq("id", target.id);
+   525→    setDeleteFieldBusy(false);
+   526→    if (error) {
+   527→      toast.error("Could not delete field.", { description: error.message });
+   528→      return;
+   529→    }
+   530→    setFields((prev) => prev.filter((f) => f.id !== target.id));
+   531→    if (selectedFieldId === target.id) {
+   532→      setSelectedFieldId(null);
+   533→      setPropsSheetOpen(false);
+   534→      setEditorDirty(false);
+   535→    }
+   536→    toast.success("Field deleted.");
+   537→    setDeleteFieldTarget(null);
+   538→  }
+   539→
+   540→  /**
+   541→   * Persist a new field order. Only rows whose sort_order actually changed
+   542→   * are written (typically 1–3 rows per move) — one batch of updates AFTER
+   543→   * the drop, never during dragging. On failure: best-effort rollback of
+   544→   * the previous order (documented limitation: not a single transaction).
+   545→   */
+   546→  async function persistOrder(nextFields: FormField[], previousFields: FormField[]) {
+   547→    setReorderError(null);
+   548→    setFields(nextFields);
+   549→
+   550→    const updates: { id: string; sort_order: number }[] = [];
+   551→    nextFields.forEach((f, idx) => {
+   552→      if (previousFields.find((p) => p.id === f.id)?.sort_order !== idx) {
+   553→        updates.push({ id: f.id, sort_order: idx });
+   554→      }
+   555→    });
+   556→    if (updates.length === 0) return;
+   557→
+   558→    try {
+   559→      const results = await Promise.all(
+   560→        updates.map((u) =>
+   561→          supabaseBrowser
+   562→            .from("form_fields")
+   563→            .update({ sort_order: u.sort_order })
+   564→            .eq("id", u.id),
+   565→        ),
+   566→      );
+   567→      const failed = results.find((r) => r.error);
+   568→      if (failed?.error) throw failed.error;
+   569→    } catch (e) {
+   570→      try {
+   571→        await Promise.all(
+   572→          previousFields.map((p) =>
+   573→            supabaseBrowser
+   574→              .from("form_fields")
+   575→              .update({ sort_order: p.sort_order })
+   576→              .eq("id", p.id),
+   577→          ),
+   578→        );
+   579→      } catch (rollbackErr) {
+   580→        console.warn("[builder] order rollback failed:", rollbackErr);
+   581→      }
+   582→      setFields(previousFields);
+   583→      setReorderError(
+   584→        "Could not save the new order. Reverted to the last saved order.",
+   585→      );
+   586→      toast.error("Could not save field order.", {
+   587→        description: e instanceof Error ? e.message : "Please try again.",
+   588→      });
+   589→    }
+   590→  }
+   591→
+   592→  /* ---------------- Drag and drop ---------------- */
+   593→
+   594→  const sensors = useSensors(
+   595→    useSensor(PointerSensor, { activationConstraint: { distance: 8 } }),
+   596→    useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 8 } }),
+   597→  );
+   598→
+   599→  function handleDragEnd(event: DragEndEvent) {
+   600→    const { active, over } = event;
+   601→    if (!over || active.id === over.id) return;
+   602→    const oldIndex = fields.findIndex((f) => f.id === active.id);
+   603→    const newIndex = fields.findIndex((f) => f.id === over.id);
+   604→    if (oldIndex === -1 || newIndex === -1) return;
+   605→    const next = arrayMove(fields, oldIndex, newIndex);
+   606→    void persistOrder(next, fields);
+   607→  }
+   608→
+   609→  function moveField(fieldId: string, direction: -1 | 1) {
+   610→    const index = fields.findIndex((f) => f.id === fieldId);
+   611→    const target = index + direction;
+   612→    if (index === -1 || target < 0 || target >= fields.length) return;
+   613→    const next = arrayMove(fields, index, target);
+   614→    void persistOrder(next, fields);
+   615→  }
+   616→
+   617→  /* ---------------- Render ---------------- */
+   618→
+   619→  if (loading) return <LoadingState title="Loading form…" />;
+   620→  if (loadError) return <ErrorState title="Couldn't load form" description={loadError} />;
+   621→  if (!form) {
+   622→    return (
+   623→      <EmptyState
+   624→        title="Form not found"
+   625→        description="This form may have been deleted, or you don't have access."
+   626→        icon={<FileText className="h-7 w-7" />}
+   627→        action={{ label: "Back to forms", href: "/dashboard/forms/" }}
+   628→      />
+   629→    );
+   630→  }
+   631→
+   632→  const busyAny =
+   633→    savingForm || deletingForm || addingField !== null || deleteFieldBusy;
+   634→
+   635→  return (
+   636→    <div
+   637→      className="flex flex-col gap-4"
+   638→      onKeyDown={(e) => {
+   639→        if (e.key === "Escape" && selectedFieldId && e.target === e.currentTarget) {
+   640→          closeProperties();
+   641→        }
+   642→      }}
+   643→    >
+   644→      {/* ================= Toolbar ================= */}
+   645→      <div className="flex flex-wrap items-center gap-2 rounded-2xl border-2 border-foreground/10 bg-surface p-2.5 sm:gap-3 sm:p-3">
+   646→        <Button asChild variant="ghost" size="icon-sm" aria-label="Back to forms">
+   647→          <Link href="/dashboard/forms/">
+   648→            <ArrowLeft className="h-4 w-4" />
+   649→          </Link>
+   650→        </Button>
+   651→
+   652→        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+   653→          <span
+   654→            className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+   655→            style={{ backgroundColor: statusColor(form.status) }}
+   656→            aria-hidden
+   657→          />
+   658→          <button
+   659→            type="button"
+   660→            onClick={() => selectField(null)}
+   661→            className="min-w-0 truncate text-left font-display text-base font-bold tracking-tight sm:text-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-md px-1"
+   662→            aria-label={`Form name: ${form.name}. Edit form settings`}
+   663→            title="Edit form settings"
+   664→          >
+   665→            {form.name}
+   666→          </button>
+   667→          {form.status === "published" && form.published_version != null && (
+   668→            <span className="hidden shrink-0 rounded-md bg-[color:var(--memphis-mint)]/15 px-2 py-0.5 text-[11px] font-semibold text-[color:var(--memphis-mint)] sm:inline">
+   669→              v{form.published_version}
+   670→            </span>
+   671→          )}
+   672→        </div>
+   673→
+   674→        {/* Save state chip */}
+   675→        <SaveStateChip
+   676→          saving={savingForm || savingFieldId !== null}
+   677→          formDirty={formDetailsDirty}
+   678→          editorDirty={editorDirty}
+   679→        />
+   680→
+   681→        {/* Actions */}
+   682→        <div className="flex items-center gap-1.5 sm:gap-2">
+   683→          <Button
+   684→            variant="outline"
+   685→            size="sm"
+   686→            onClick={() => setPreviewOpen(true)}
+   687→            disabled={busyAny}
+   688→            aria-label="Preview form"
+   689→          >
+   690→            <Eye className="h-4 w-4" />
+   691→            <span className="hidden sm:inline">Preview</span>
+   692→          </Button>
+   693→          <Button
+   694→            variant="outline"
+   695→            size="sm"
+   696→            onClick={() => setShareOpen(true)}
+   697→            disabled={busyAny}
+   698→            aria-label="Share form link"
+   699→          >
+   700→            <Share2 className="h-4 w-4" />
+   701→            <span className="hidden sm:inline">Share</span>
+   702→          </Button>
+   703→          <Button
+   704→            variant="memphis-coral"
+   705→            size="sm"
+   706→            onClick={() => setPublishOpen(true)}
+   707→            disabled={busyAny}
+   708→            aria-label={form.status === "published" ? "Publish a new version" : "Publish form"}
+   709→          >
+   710→            <Rocket className="h-4 w-4" />
+   711→            <span className="hidden sm:inline">
+   712→              {form.status === "published" ? "Republish" : "Publish"}
+   713→            </span>
+   714→          </Button>
+   715→          <DropdownMenu>
+   716→            <DropdownMenuTrigger asChild>
+   717→              <Button variant="ghost" size="icon-sm" aria-label="More actions" disabled={busyAny}>
+   718→                <MoreHorizontal className="h-4 w-4" />
+   719→              </Button>
+   720→            </DropdownMenuTrigger>
+   721→            <DropdownMenuContent align="end">
+   722→              <DropdownMenuItem
+   723→                onClick={() => setDeleteFormOpen(true)}
+   724→                className="gap-2 text-destructive focus:text-destructive"
+   725→                disabled={deletingForm}
+   726→              >
+   727→                <Trash2 className="h-4 w-4" />
+   728→                Delete form
+   729→              </DropdownMenuItem>
+   730→            </DropdownMenuContent>
+   731→          </DropdownMenu>
+   732→        </div>
+   733→
+   734→        {/* Mobile: open field library */}
+   735→        <Button
+   736→          variant="outline"
+   737→          size="sm"
+   738→          className="w-full lg:hidden"
+   739→          onClick={() => setLibrarySheetOpen(true)}
+   740→          disabled={busyAny}
+   741→          aria-label="Open field library to add a field"
+   742→        >
+   743→          <Plus className="h-4 w-4" />
+   744→          Add field
+   745→        </Button>
+   746→      </div>
+   747→
+   748→      {/* ================= 3-pane workspace ================= */}
+   749→      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:h-[calc(100vh-9rem)]">
+   750→        <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row">
+   751→          {/* ── Left: field library (lg+) ── */}
+   752→          <aside
+   753→            className="hidden w-52 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex xl:w-56"
+   754→            aria-label="Field library"
+   755→          >
+   756→            <div className="border-b border-foreground/10 px-3 py-2.5">
+   757→              <p className="font-display text-sm font-bold">Add fields</p>
+   758→              <p className="text-[11px] text-muted-foreground">
+   759→                Click to append to the form
+   760→              </p>
+   761→            </div>
+   762→            <div className="min-h-0 flex-1">
+   763→              <FieldLibrary
+   764→                onAdd={addField}
+   765→                disabled={addingField !== null || deletingForm || savingForm}
+   766→                fieldCount={fields.length}
+   767→              />
+   768→            </div>
+   769→          </aside>
+   770→
+   771→          {/* ── Center: live canvas ── */}
+   772→          <main
+   773→            className="min-w-0 flex-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-[color:var(--surface)]/60 p-3 sm:p-4 lg:p-5"
+   774→            aria-label="Form canvas"
+   775→          >
+   776→            <div className="mx-auto w-full max-w-2xl">
+   777→              {/* Respondent-view header (read-only preview of form intro) */}
+   778→              <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
+   779→                <GeometricCircle color="coral" size={32} className="-top-3 -right-3 opacity-70" />
+   780→                <div className="relative">
+   781→                  <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+   782→                    <Eye className="h-3 w-3" aria-hidden />
+   783→                    Respondent view
+   784→                  </p>
+   785→                  <h2 className="font-display text-2xl font-bold tracking-tight text-foreground">
+   786→                    {form.name}
+   787→                  </h2>
+   788→                  {form.description && (
+   789→                    <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+   790→                      {form.description}
+   791→                    </p>
+   792→                  )}
+   793→                  <p className="mt-2.5 text-xs text-muted-foreground/80">
+   794→                    {fields.length} field{fields.length === 1 ? "" : "s"}
+   795→                    {submitLabel.trim() ? ` · button “${submitLabel.trim()}”` : ""}
+   796→                  </p>
+   797→                </div>
+   798→              </div>
+   799→
+   800→              {/* Field limit warning */}
+   801→              {fields.length >= FIELD_LIMIT_WARN_AT && (
+   802→                <div
+   803→                  role="status"
+   804→                  className={cn(
+   805→                    "mt-3 flex items-start gap-2 rounded-xl border-2 p-3 text-xs font-medium",
+   806→                    fields.length >= MAX_FIELDS_PER_FORM
+   807→                      ? "border-destructive/40 bg-destructive/10 text-destructive"
+   808→                      : "border-[color:var(--memphis-sun)]/40 bg-[color:var(--memphis-sun)]/10 text-[color:var(--memphis-sun)]",
+   809→                  )}
+   810→                >
+   811→                  <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+   812→                  <span>
+   813→                    {fields.length >= MAX_FIELDS_PER_FORM
+   814→                      ? `Field limit reached (${fields.length}/${MAX_FIELDS_PER_FORM}) — remove fields to add more.`
+   815→                      : `Approaching the field limit (${fields.length}/${MAX_FIELDS_PER_FORM}).`}
+   816→                  </span>
+   817→                </div>
+   818→              )}
+   819→
+   820→              {reorderError && (
+   821→                <p
+   822→                  role="alert"
+   823→                  className="mt-3 rounded-lg bg-destructive/10 p-2.5 text-xs font-medium text-destructive"
+   824→                >
+   825→                  {reorderError}
+   826→                </p>
+   827→              )}
+   828→
+   829→              {/* Field cards */}
+   830→              {fields.length === 0 ? (
+   831→                <div className="mt-4 rounded-2xl border-2 border-dashed border-foreground/20 p-8 text-center">
+   832→                  <GeometricTriangle
+   833→                    color="violet"
+   834→                    size={20}
+   835→                    rotate={-12}
+   836→                    className="relative mx-auto mb-3 opacity-60"
+   837→                  />
+   838→                  <p className="font-display text-base font-bold">No fields yet</p>
+   839→                  <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
+   840→                    Add your first field from the library{isDesktop ? " on the left" : ""}. Every
+   841→                    field is stored as a normalized database row — no mock data.
+   842→                  </p>
+   843→                  <Button
+   844→                    variant="memphis-outline"
+   845→                    size="sm"
+   846→                    className="mt-4 lg:hidden"
+   847→                    onClick={() => setLibrarySheetOpen(true)}
+   848→                    aria-label="Add your first field"
+   849→                  >
+   850→                    <Plus className="h-4 w-4" />
+   851→                    Add field
+   852→                  </Button>
+   853→                </div>
+   854→              ) : (
+   855→                <DndContext
+   856→                  sensors={sensors}
+   857→                  collisionDetection={closestCenter}
+   858→                  onDragEnd={handleDragEnd}
+   859→                >
+   860→                  <SortableContext items={fieldIds} strategy={verticalListSortingStrategy}>
+   861→                    <ul className="mt-4 grid grid-cols-1 gap-5 sm:grid-cols-12 sm:gap-x-4">
+   862→                      {fields.map((field, index) => (
+   863→                        <CanvasFieldCard
+   864→                          key={field.id}
+   865→                          field={field}
+   866→                          index={index}
+   867→                          total={fields.length}
+   868→                          selected={selectedFieldId === field.id}
+   869→                          busy={
+   870→                            addingField !== null ||
+   871→                            deleteFieldBusy ||
+   872→                            deletingForm ||
+   873→                            savingForm
+   874→                          }
+   875→                          saving={savingFieldId === field.id}
+   876→                          duplicating={duplicatingFieldId === field.id}
+   877→                          onSelect={() =>
+   878→                            selectField(selectedFieldId === field.id ? null : field.id)
+   879→                          }
+   880→                          onMove={(dir) => moveField(field.id, dir)}
+   881→                          onDuplicate={() => duplicateField(field)}
+   882→                          onDelete={() => setDeleteFieldTarget(field)}
+   883→                        />
+   884→                      ))}
+   885→                    </ul>
+   886→                  </SortableContext>
+   887→                </DndContext>
+   888→              )}
+   889→
+   890→              {/* Canvas footer: add field (mobile) */}
+   891→              {fields.length > 0 && (
+   892→                <Button
+   893→                  variant="outline"
+   894→                  size="sm"
+   895→                  className="mt-4 w-full border-dashed lg:hidden"
+   896→                  onClick={() => setLibrarySheetOpen(true)}
+   897→                  disabled={busyAny}
+   898→                  aria-label="Add another field"
+   899→                >
+   900→                  <Plus className="h-4 w-4" />
+   901→                  Add field
+   902→                </Button>
+   903→              )}
+   904→            </div>
+   905→          </main>
+   906→
+   907→          {/* ── Right: properties (lg+) ── */}
+   908→          <aside
+   909→            className="hidden w-80 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex xl:w-96"
+   910→            aria-label="Properties"
+   911→          >
+   912→            <PropertiesPanel
+   913→              form={form}
+   914→              fields={fields}
+   915→              selectedField={selectedField}
+   916→              savingForm={savingForm}
+   917→              savingField={savingFieldId === selectedField?.id}
+   918→              editorDirty={editorDirty}
+   919→              name={name}
+   920→              description={description}
+   921→              submitLabel={submitLabel}
+   922→              onName={setName}
+   923→              onDescription={setDescription}
+   924→              onSubmitLabel={setSubmitLabel}
+   925→              onSaveForm={saveForm}
+   926→              formDetailsDirty={formDetailsDirty}
+   927→              onOpenShare={() => setShareOpen(true)}
+   928→              onSelectField={(id) => selectField(id)}
+   929→              onClose={closeProperties}
+   930→              onEditorDirty={setEditorDirty}
+   931→              onSaveField={saveField}
+   932→            />
+   933→          </aside>
+   934→        </div>
+   935→      </div>
+   936→
+   937→      {/* ================= Tablet/mobile Sheets ================= */}
+   938→
+   939→      {/* Field library sheet */}
+   940→      {!isDesktop && (
+   941→        <Sheet open={librarySheetOpen} onOpenChange={setLibrarySheetOpen}>
+   942→          <SheetContent
+   943→            side="left"
+   944→            className="flex w-80 max-w-[92vw] flex-col gap-0 p-0 sm:max-w-md"
+   945→          >
+   946→            <SheetHeader className="border-b border-foreground/10 px-4 py-3">
+   947→              <SheetTitle className="text-left">Add a field</SheetTitle>
+   948→            </SheetHeader>
+   949→            <div className="min-h-0 flex-1">
+   950→              <FieldLibrary
+   951→                onAdd={addField}
+   952→                disabled={addingField !== null}
+   953→                fieldCount={fields.length}
+   954→              />
+   955→            </div>
+   956→          </SheetContent>
+   957→        </Sheet>
+   958→      )}
+   959→
+   960→      {/* Properties sheet */}
+   961→      {!isDesktop && (
+   962→        <Sheet
+   963→          open={propsSheetOpen && selectedField !== null}
+   964→          onOpenChange={(o) => {
+   965→            if (!o) closeProperties();
+   966→          }}
+   967→        >
+   968→          <SheetContent
+   969→            side="right"
+   970→            className="flex w-[85vw] max-w-md flex-col gap-0 overflow-y-auto p-0 sm:w-96"
+   971→          >
+   972→            <SheetHeader className="sticky top-0 z-10 border-b border-foreground/10 bg-surface px-4 py-3">
+   973→              <SheetTitle className="flex items-center justify-between text-left">
+   974→                Field properties
+   975→                <Button
+   976→                  variant="ghost"
+   977→                  size="icon-sm"
+   978→                  onClick={closeProperties}
+   979→                  aria-label="Close field properties"
+   980→                >
+   981→                  <X className="h-4 w-4" />
+   982→                </Button>
+   983→              </SheetTitle>
+   984→            </SheetHeader>
+   985→            <div className="p-4">
+   986→              {selectedField && (
+   987→                <FieldEditor
+   988→                  key={selectedField.id}
+   989→                  field={selectedField}
+   990→                  saving={savingFieldId === selectedField.id}
+   991→                  onSave={(draft) => saveField(selectedField.id, draft)}
+   992→                  onCancel={closeProperties}
+   993→                  onDirtyChange={setEditorDirty}
+   994→                />
+   995→              )}
+   996→            </div>
+   997→          </SheetContent>
+   998→        </Sheet>
+   999→      )}
+  1000→
+  1001→      {/* ================= Dialogs ================= */}
+  1002→
+  1003→      <PreviewDialog
+  1004→        open={previewOpen}
+  1005→        onOpenChange={setPreviewOpen}
+  1006→        form={{
+  1007→          name: form.name,
+  1008→          description: form.description,
+  1009→          settings: (form.settings ?? {}) as Record<string, unknown>,
+  1010→        }}
+  1011→        fields={fields.map(toRenderableField)}
+  1012→      />
+  1013→
+  1014→      <PublishDialog
+  1015→        open={publishOpen}
+  1016→        onOpenChange={setPublishOpen}
+  1017→        formId={form.id}
+  1018→        formName={form.name}
+  1019→        fieldCount={fields.length}
+  1020→        hasFileUpload={hasFileUpload}
+  1021→        onPublished={({ version }) => {
+  1022→          setForm((prev) =>
+  1023→            prev ? { ...prev, status: "published", published_version: version } : prev,
+  1024→          );
+  1025→        }}
+  1026→      />
+  1027→
+  1028→      <ShareDialog
+  1029→        open={shareOpen}
+  1030→        onOpenChange={setShareOpen}
+  1031→        publicKey={form.public_key}
+  1032→        version={form.published_version}
+  1033→        status={form.status}
+  1034→      />
+  1035→
+  1036→      {/* Delete form */}
+  1037→      <AlertDialog open={deleteFormOpen} onOpenChange={setDeleteFormOpen}>
+  1038→        <AlertDialogContent>
+  1039→          <AlertDialogHeader>
+  1040→            <AlertDialogTitle>Delete “{form.name}”?</AlertDialogTitle>
+  1041→            <AlertDialogDescription>
+  1042→              The form, its fields, and every collected response will be permanently
+  1043→              removed. This cannot be undone.
+  1044→            </AlertDialogDescription>
+  1045→          </AlertDialogHeader>
+  1046→          <AlertDialogFooter>
+  1047→            <AlertDialogCancel disabled={deletingForm}>Cancel</AlertDialogCancel>
+  1048→            <AlertDialogAction
+  1049→              onClick={(e) => {
+  1050→                e.preventDefault();
+  1051→                void deleteForm();
+  1052→              }}
+  1053→              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+  1054→            >
+  1055→              {deletingForm ? "Deleting…" : "Delete form"}
+  1056→            </AlertDialogAction>
+  1057→          </AlertDialogFooter>
+  1058→        </AlertDialogContent>
+  1059→      </AlertDialog>
+  1060→
+  1061→      {/* Delete field */}
+  1062→      <AlertDialog
+  1063→        open={deleteFieldTarget !== null}
+  1064→        onOpenChange={(o) => {
+  1065→          if (!o && !deleteFieldBusy) setDeleteFieldTarget(null);
+  1066→        }}
+  1067→      >
+  1068→        <AlertDialogContent>
+  1069→          <AlertDialogHeader>
+  1070→            <AlertDialogTitle>
+  1071→              Delete field “{deleteFieldTarget?.label}”?
+  1072→            </AlertDialogTitle>
+  1073→            <AlertDialogDescription>
+  1074→              The field is removed from the form immediately. Answers already collected
+  1075→              for it are preserved in existing submissions. This cannot be undone.
+  1076→            </AlertDialogDescription>
+  1077→          </AlertDialogHeader>
+  1078→          <AlertDialogFooter>
+  1079→            <AlertDialogCancel disabled={deleteFieldBusy}>Cancel</AlertDialogCancel>
+  1080→            <AlertDialogAction
+  1081→              onClick={(e) => {
+  1082→                e.preventDefault();
+  1083→                if (deleteFieldTarget) void deleteField(deleteFieldTarget);
+  1084→              }}
+  1085→              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+  1086→            >
+  1087→              {deleteFieldBusy ? "Deleting…" : "Delete field"}
+  1088→            </AlertDialogAction>
+  1089→          </AlertDialogFooter>
+  1090→        </AlertDialogContent>
+  1091→      </AlertDialog>
+  1092→
+  1093→      {/* Discard unsaved field edits */}
+  1094→      <AlertDialog open={discardOpen} onOpenChange={setDiscardOpen}>
+  1095→        <AlertDialogContent>
+  1096→          <AlertDialogHeader>
+  1097→            <AlertDialogTitle>Discard unsaved edits?</AlertDialogTitle>
+  1098→            <AlertDialogDescription>
+  1099→              This field has changes that were never saved to the database. Discarding
+  1100→              them cannot be undone.
+  1101→            </AlertDialogDescription>
+  1102→          </AlertDialogHeader>
+  1103→          <AlertDialogFooter>
+  1104→            <AlertDialogCancel onClick={() => setDiscardOpen(false)}>
+  1105→              Keep editing
+  1106→            </AlertDialogCancel>
+  1107→            <AlertDialogAction onClick={confirmDiscard}>
+  1108→              Discard changes
+  1109→            </AlertDialogAction>
+  1110→          </AlertDialogFooter>
+  1111→        </AlertDialogContent>
+  1112→      </AlertDialog>
+  1113→    </div>
+  1114→  );
+  1115→}
+  1116→
+  1117→/* ------------------------------------------------------------------ */
+  1118→/* Save state chip                                                      */
+  1119→/* ------------------------------------------------------------------ */
+  1120→
+  1121→function SaveStateChip({
+  1122→  saving,
+  1123→  formDirty,
+  1124→  editorDirty,
+  1125→}: {
+  1126→  saving: boolean;
+  1127→  formDirty: boolean;
+  1128→  editorDirty: boolean;
+  1129→}) {
+  1130→  let label: string;
+  1131→  let cls: string;
+  1132→  let icon = <Check className="h-3 w-3" aria-hidden />;
+  1133→  if (saving) {
+  1134→    label = "Saving…";
+  1135→    cls = "bg-[color:var(--memphis-sun)]/15 text-[color:var(--memphis-sun)]";
+  1136→    icon = <Loader2 className="h-3 w-3 animate-spin" aria-hidden />;
+  1137→  } else if (editorDirty) {
+  1138→    label = "Unsaved field edits";
+  1139→    cls = "bg-[color:var(--memphis-coral)]/12 text-[color:var(--memphis-coral)]";
+  1140→    icon = <TriangleAlert className="h-3 w-3" aria-hidden />;
+  1141→  } else if (formDirty) {
+  1142→    label = "Unsaved changes";
+  1143→    cls = "bg-[color:var(--memphis-coral)]/12 text-[color:var(--memphis-coral)]";
+  1144→    icon = <TriangleAlert className="h-3 w-3" aria-hidden />;
+  1145→  } else {
+  1146→    label = "All changes saved";
+  1147→    cls = "bg-[color:var(--memphis-mint)]/15 text-[color:var(--memphis-mint)]";
+  1148→  }
+  1149→  return (
+  1150→    <span
+  1151→      role="status"
+  1152→      aria-live="polite"
+  1153→      className={cn(
+  1154→        "hidden shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-semibold md:inline-flex",
+  1155→        cls,
+  1156→      )}
+  1157→    >
+  1158→      {icon}
+  1159→      {label}
+  1160→    </span>
+  1161→  );
+  1162→}
+  1163→
+  1164→/* ------------------------------------------------------------------ */
+  1165→/* Properties panel (desktop right pane)                                */
+  1166→/* ------------------------------------------------------------------ */
+  1167→
+  1168→function PropertiesPanel({
+  1169→  form,
+  1170→  fields,
+  1171→  selectedField,
+  1172→  savingForm,
+  1173→  savingField,
+  1174→  editorDirty,
+  1175→  name,
+  1176→  description,
+  1177→  submitLabel,
+  1178→  onName,
+  1179→  onDescription,
+  1180→  onSubmitLabel,
+  1181→  onSaveForm,
+  1182→  formDetailsDirty,
+  1183→  onOpenShare,
+  1184→  onSelectField,
+  1185→  onClose,
+  1186→  onEditorDirty,
+  1187→  onSaveField,
+  1188→}: {
+  1189→  form: FormRow;
+  1190→  fields: FormField[];
+  1191→  selectedField: FormField | null;
+  1192→  savingForm: boolean;
+  1193→  savingField: boolean;
+  1194→  editorDirty: boolean;
+  1195→  name: string;
+  1196→  description: string;
+  1197→  submitLabel: string;
+  1198→  onName: (v: string) => void;
+  1199→  onDescription: (v: string) => void;
+  1200→  onSubmitLabel: (v: string) => void;
+  1201→  onSaveForm: () => void;
+  1202→  formDetailsDirty: boolean;
+  1203→  onOpenShare: () => void;
+  1204→  onSelectField: (id: string | null) => void;
+  1205→  onClose: () => void;
+  1206→  onEditorDirty: (dirty: boolean) => void;
+  1207→  onSaveField: (
+  1208→    fieldId: string,
+  1209→    draft: {
+  1210→      label: string;
+  1211→      description: string | null;
+  1212→      placeholder: string | null;
+  1213→      help_text: string | null;
+  1214→      is_required: boolean;
+  1215→      width: number;
+  1216→      config: Record<string, unknown>;
+  1217→    },
+  1218→  ) => Promise<boolean>;
+  1219→}) {
+  1220→  return (
+  1221→    <div className="flex h-full min-h-0 flex-col">
+  1222→      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-foreground/10 px-4 py-2.5">
+  1223→        <p className="font-display text-sm font-bold">
+  1224→          {selectedField ? "Field properties" : "Form settings"}
+  1225→        </p>
+  1226→        {selectedField && (
+  1227→          <Button
+  1228→            variant="ghost"
+  1229→            size="icon-sm"
+  1230→            onClick={onClose}
+  1231→            aria-label="Close field properties"
+  1232→          >
+  1233→            <X className="h-4 w-4" />
+  1234→          </Button>
+  1235→        )}
+  1236→      </div>
+  1237→
+  1238→      <div className="min-h-0 flex-1 overflow-y-auto p-4">
+  1239→        {selectedField ? (
+  1240→          <FieldEditor
+  1241→            key={selectedField.id}
+  1242→            field={selectedField}
+  1243→            saving={savingField}
+  1244→            onSave={(draft) => onSaveField(selectedField.id, draft)}
+  1245→            onCancel={onClose}
+  1246→            onDirtyChange={onEditorDirty}
+  1247→          />
+  1248→        ) : (
+  1249→          <FormSettingsView
+  1250→            form={form}
+  1251→            fields={fields}
+  1252→            saving={savingForm}
+  1253→            dirty={formDetailsDirty || editorDirty}
+  1254→            name={name}
+  1255→            description={description}
+  1256→            submitLabel={submitLabel}
+  1257→            onName={onName}
+  1258→            onDescription={onDescription}
+  1259→            onSubmitLabel={onSubmitLabel}
+  1260→            onSave={onSaveForm}
+  1261→            onOpenShare={onOpenShare}
+  1262→            onSelectField={onSelectField}
+  1263→          />
+  1264→        )}
+  1265→      </div>
+  1266→    </div>
+  1267→  );
+  1268→}
+  1269→
+  1270→function FormSettingsView({
+  1271→  form,
+  1272→  fields,
+  1273→  saving,
+  1274→  dirty,
+  1275→  name,
+  1276→  description,
+  1277→  submitLabel,
+  1278→  onName,
+  1279→  onDescription,
+  1280→  onSubmitLabel,
+  1281→  onSave,
+  1282→  onOpenShare,
+  1283→  onSelectField,
+  1284→}: {
+  1285→  form: FormRow;
+  1286→  fields: FormField[];
+  1287→  saving: boolean;
+  1288→  dirty: boolean;
+  1289→  name: string;
+  1290→  description: string;
+  1291→  submitLabel: string;
+  1292→  onName: (v: string) => void;
+  1293→  onDescription: (v: string) => void;
+  1294→  onSubmitLabel: (v: string) => void;
+  1295→  onSave: () => void;
+  1296→  onOpenShare: () => void;
+  1297→  onSelectField: (id: string | null) => void;
+  1298→}) {
+  1299→  const statusLabel = (
+  1300→    <span className="inline-flex items-center gap-1.5">
+  1301→      <span
+  1302→        className="inline-block h-2 w-2 rounded-full"
+  1303→        style={{ backgroundColor: statusColor(form.status) }}
+  1304→        aria-hidden
+  1305→      />
+  1306→      <span className="capitalize">{form.status}</span>
+  1307→      {form.status === "published" && form.published_version != null && (
+  1308→        <span className="text-muted-foreground">· v{form.published_version}</span>
+  1309→      )}
+  1310→    </span>
+  1311→  );
+  1312→
+  1313→  return (
+  1314→    <div className="space-y-4">
+  1315→      {/* Field list quick nav (form settings home) */}
+  1316→      <div className="rounded-xl bg-background p-3">
+  1317→        <div className="mb-2 flex items-center justify-between">
+  1318→          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+  1319→            Status
+  1320→          </p>
+  1321→          {statusLabel}
+  1322→        </div>
+  1323→        <div className="mb-2 flex items-center justify-between">
+  1324→          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+  1325→            Fields
+  1326→          </p>
+  1327→          <p className="text-xs text-foreground">
+  1328→            {fields.length} ·{" "}
+  1329→            {fields.filter((f) => f.is_required).length} required
+  1330→          </p>
+  1331→        </div>
+  1332→        {form.status !== "draft" && (
+  1333→          <Button variant="outline" size="sm" className="w-full" onClick={onOpenShare}>
+  1334→            <Share2 className="h-3.5 w-3.5" />
+  1335→            Share link
+  1336→          </Button>
+  1337→        )}
+  1338→      </div>
+  1339→
+  1340→      {fields.length > 0 && (
+  1341→        <div>
+  1342→          <p className="mb-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+  1343→            Fields — click to edit
+  1344→          </p>
+  1345→          <ul className="space-y-1">
+  1346→            {fields.map((f, i) => {
+  1347→              const meta = fieldMeta(f.field_type);
+  1348→              const Icon = meta?.icon;
+  1349→              return (
+  1350→                <li key={f.id}>
+  1351→                  <button
+  1352→                    type="button"
+  1353→                    onClick={() => onSelectField(f.id)}
+  1354→                    className="flex w-full items-center gap-2 rounded-lg border border-transparent bg-background px-2.5 py-1.5 text-left text-sm transition-colors hover:border-foreground/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+  1355→                    aria-label={`Edit field ${f.label}`}
+  1356→                  >
+  1357→                    <span className="w-4 shrink-0 text-[11px] text-muted-foreground">
+  1358→                      {i + 1}
+  1359→                    </span>
+  1360→                    {Icon ? <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden /> : null}
+  1361→                    <span className="min-w-0 flex-1 truncate">{f.label}</span>
+  1362→                    {f.is_required && (
+  1363→                      <span
+  1364→                        className="h-1.5 w-1.5 shrink-0 rounded-full bg-[color:var(--memphis-coral)]"
+  1365→                        aria-label="required"
+  1366→                      />
+  1367→                    )}
+  1368→                  </button>
+  1369→                </li>
+  1370→              );
+  1371→            })}
+  1372→          </ul>
+  1373→        </div>
+  1374→      )}
+  1375→
+  1376→      <div className="space-y-4 border-t border-foreground/10 pt-4">
+  1377→        <div className="space-y-2">
+  1378→          <Label htmlFor="form-name">Name</Label>
+  1379→          <Input
+  1380→            id="form-name"
+  1381→            value={name}
+  1382→            onChange={(e) => onName(e.target.value)}
+  1383→            disabled={saving}
+  1384→            className="h-10"
+  1385→          />
+  1386→        </div>
+  1387→        <div className="space-y-2">
+  1388→          <Label htmlFor="form-description">Description (optional)</Label>
+  1389→          <Textarea
+  1390→            id="form-description"
+  1391→            value={description}
+  1392→            onChange={(e) => onDescription(e.target.value)}
+  1393→            rows={3}
+  1394→            disabled={saving}
+  1395→            placeholder="Shown under the form title to respondents"
+  1396→          />
+  1397→        </div>
+  1398→        <div className="space-y-2">
+  1399→          <Label htmlFor="form-submit-label">Submit button label</Label>
+  1400→          <Input
+  1401→            id="form-submit-label"
+  1402→            value={submitLabel}
+  1403→            onChange={(e) => onSubmitLabel(e.target.value)}
+  1404→            disabled={saving}
+  1405→            className="h-10"
+  1406→            placeholder="Submit"
+  1407→            maxLength={40}
+  1408→          />
+  1409→          <p className="text-[11px] text-muted-foreground">
+  1410→            The button respondents press (defaults to “Submit”).
+  1411→          </p>
+  1412→        </div>
+  1413→        <div className="flex items-center justify-between gap-3">
+  1414→          <p className="text-[11px] text-muted-foreground" role="status">
+  1415→            {dirty ? "Unsaved changes" : "Saved to database"}
+  1416→          </p>
+  1417→          <Button variant="memphis-coral" size="sm" onClick={onSave} disabled={saving}>
+  1418→            {saving ? "Saving…" : "Save changes"}
+  1419→          </Button>
+  1420→        </div>
+  1421→      </div>
+  1422→    </div>
+  1423→  );
+  1424→}
+  1425→
+  1426→/* ------------------------------------------------------------------ */
+  1427→/* CanvasFieldCard — selectable/draggable wrapper around the field      */
+  1428→/* ------------------------------------------------------------------ */
+  1429→
+  1430→function CanvasFieldCard({
+  1431→  field,
+  1432→  index,
+  1433→  total,
+  1434→  selected,
+  1435→  busy,
+  1436→  saving,
+  1437→  duplicating,
+  1438→  onSelect,
+  1439→  onMove,
+  1440→  onDuplicate,
+  1441→  onDelete,
+  1442→}: {
+  1443→  field: FormField;
+  1444→  index: number;
+  1445→  total: number;
+  1446→  selected: boolean;
+  1447→  busy: boolean;
+  1448→  saving: boolean;
+  1449→  duplicating: boolean;
+  1450→  onSelect: () => void;
+  1451→  onMove: (direction: -1 | 1) => void;
+  1452→  onDuplicate: () => void;
+  1453→  onDelete: () => void;
+  1454→}) {
+  1455→  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+  1456→    useSortable({ id: field.id });
+  1457→
+  1458→  const meta = fieldMeta(field.field_type);
+  1459→  const rf = toRenderableField(field);
+  1460→  const isSection = field.field_type === "section";
+  1461→
+  1462→  const style = {
+  1463→    transform: CSS.Transform.toString(transform),
+  1464→    transition,
+  1465→  };
+  1466→
+  1467→  return (
+  1468→    <li
+  1469→      ref={setNodeRef}
+  1470→      data-field-id={field.id}
+  1471→      style={{ ...style, "--field-w": field.width } as React.CSSProperties}
+  1472→      className={cn("form-field-cell list-none", isDragging && "z-20")}
+  1473→    >
+  1474→      <div
+  1475→        role="button"
+  1476→        tabIndex={0}
+  1477→        onClick={onSelect}
+  1478→        onKeyDown={(e) => {
+  1479→          if (e.key === "Enter" || e.key === " ") {
+  1480→            e.preventDefault();
+  1481→            onSelect();
+  1482→          }
+  1483→        }}
+  1484→        aria-pressed={selected}
+  1485→        aria-label={`${selected ? "Close" : "Open"} properties for ${field.label} (${meta?.label ?? field.field_type})`}
+  1486→        className={cn(
+  1487→          "group relative cursor-pointer rounded-2xl border-2 p-4 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+  1488→          isSection
+  1489→            ? "border-dashed border-foreground/25 bg-transparent hover:border-foreground/40"
+  1490→            : "border-foreground/10 bg-surface hover:border-foreground/30",
+  1491→          selected && "border-[color:var(--memphis-coral)] bg-surface shadow-[4px_4px_0_0_var(--memphis-ink)]",
+  1492→          isDragging && "opacity-80 shadow-lg",
+  1493→        )}
+  1494→      >
+  1495→        {/* Action toolbar — visible on hover / selection / focus-within */}
+  1496→        <div
+  1497→          className={cn(
+  1498→            "absolute -top-3 right-3 z-10 flex items-center gap-0.5 rounded-lg border-2 border-foreground/10 bg-surface px-1 py-0.5 transition-opacity",
+  1499→            selected ? "opacity-100" : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100",
+  1500→          )}
+  1501→          role="toolbar"
+  1502→          aria-label={`Actions for ${field.label}`}
+  1503→        >
+  1504→          <Button
+  1505→            variant="ghost"
+  1506→            size="icon-sm"
+  1507→            onClick={(e) => {
+  1508→              e.stopPropagation();
+  1509→              onMove(-1);
+  1510→            }}
+  1511→            disabled={index === 0 || busy}
+  1512→            aria-label={`Move ${field.label} up`}
+  1513→          >
+  1514→            <ChevronUp className="h-3.5 w-3.5" />
+  1515→          </Button>
+  1516→          <Button
+  1517→            variant="ghost"
+  1518→            size="icon-sm"
+  1519→            onClick={(e) => {
+  1520→              e.stopPropagation();
+  1521→              onMove(1);
+  1522→            }}
+  1523→            disabled={index === total - 1 || busy}
+  1524→            aria-label={`Move ${field.label} down`}
+  1525→          >
+  1526→            <ChevronDown className="h-3.5 w-3.5" />
+  1527→          </Button>
+  1528→          <Button
+  1529→            variant="ghost"
+  1530→            size="icon-sm"
+  1531→            onClick={(e) => {
+  1532→              e.stopPropagation();
+  1533→              onDuplicate();
+  1534→            }}
+  1535→            disabled={busy}
+  1536→            aria-label={`Duplicate ${field.label}`}
+  1537→          >
+  1538→            {duplicating ? (
+  1539→              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+  1540→            ) : (
+  1541→              <Copy className="h-3.5 w-3.5" />
+  1542→            )}
+  1543→          </Button>
+  1544→          <Button
+  1545→            variant="ghost"
+  1546→            size="icon-sm"
+  1547→            onClick={(e) => {
+  1548→              e.stopPropagation();
+  1549→              onDelete();
+  1550→            }}
+  1551→            disabled={busy}
+  1552→            aria-label={`Delete ${field.label}`}
+  1553→            className="text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+  1554→          >
+  1555→            <Trash2 className="h-3.5 w-3.5" />
+  1556→          </Button>
+  1557→        </div>
+  1558→
+  1559→        {/* Drag handle */}
+  1560→        <button
+  1561→          type="button"
+  1562→          className={cn(
+  1563→            "absolute -left-3 top-4 z-10 flex h-7 w-5 cursor-grab touch-none items-center justify-center rounded-md border-2 border-foreground/10 bg-surface text-muted-foreground/70 transition-opacity hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40",
+  1564→            selected ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+  1565→          )}
+  1566→          disabled={busy}
+  1567→          {...attributes}
+  1568→          {...listeners}
+  1569→          aria-label={`Reorder ${field.label} (drag, or use the up and down buttons)`}
+  1570→        >
+  1571→          <GripVertical className="h-3.5 w-3.5" />
+  1572→        </button>
+  1573→
+  1574→        {/* Selected-state badge: type + key */}
+  1575→        <div
+  1576→          className={cn(
+  1577→            "mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground transition-opacity",
+  1578→            selected ? "opacity-100" : "opacity-0 group-hover:opacity-100",
+  1579→          )}
+  1580→        >
+  1581→          {meta?.icon ? (
+  1582→            <meta.icon className="h-3.5 w-3.5 text-[color:var(--memphis-coral)]" aria-hidden />
+  1583→          ) : null}
+  1584→          <span className="font-semibold">{meta?.label ?? field.field_type}</span>
+  1585→          <span className="font-mono opacity-70">{field.field_key}</span>
+  1586→          <span className="ml-auto opacity-70">#{index + 1}</span>
+  1587→        </div>
+  1588→
+  1589→        {/* The field exactly as respondents see it — visually exact,
+  1590→            interaction-inert (pointer-events pass through to the card,
+  1591→            so clicking an input selects the field) */}
+  1592→        <div className="builder-inert">
+  1593→          <FieldRendererForCanvas field={rf} selected={selected} saving={saving} />
+  1594→        </div>
+  1595→      </div>
+  1596→    </li>
+  1597→  );
+  1598→}
+  1599→
+  1600→/**
+  1601→ * Canvas-side field rendering — composes the SHARED atoms
+  1602→ * (FieldLabelBlock + FieldControl) so the canvas can never drift from
+  1603→ * the preview/public rendering. Section fields render their divider
+  1604→ * form. Inputs are inert (builder mode) — clicks select the card.
+  1605→ */
+  1606→function FieldRendererForCanvas({
+  1607→  field,
+  1608→  selected,
+  1609→  saving,
+  1610→}: {
+  1611→  field: ReturnType<typeof toRenderableField>;
+  1612→  selected: boolean;
+  1613→  saving: boolean;
+  1614→}) {
+  1615→  const id = `canvas-${field.field_key}`;
+  1616→  if (field.field_type === "section") {
+  1617→    return (
+  1618→      <div>
+  1619→        <div className="flex items-center gap-2.5">
+  1620→          <span
+  1621→            className="inline-block h-2.5 w-2.5 rotate-45 bg-[color:var(--memphis-coral)]"
+  1622→            aria-hidden
+  1623→          />
+  1624→          <h3 className="font-display text-lg font-bold text-foreground">{field.label}</h3>
+  1625→        </div>
+  1626→        {field.description && (
+  1627→          <p className="mt-1 text-sm text-muted-foreground">{field.description}</p>
+  1628→        )}
+  1629→        {field.help_text && (
+  1630→          <p className="mt-0.5 text-xs text-muted-foreground/80">{field.help_text}</p>
+  1631→        )}
+  1632→      </div>
+  1633→    );
+  1634→  }
+  1635→  return (
+  1636→    <div className="space-y-1.5">
+  1637→      <FieldLabelBlock field={field} htmlFor={id} />
+  1638→      <FieldControl
+  1639→        field={field}
+  1640→        value={undefined}
+  1641→        onChange={() => {
+  1642→          /* inert in builder mode — the card's click selects it */
+  1643→        }}
+  1644→        disabled={true}
+  1645→        id={id}
+  1646→      />
+  1647→      {saving && (
+  1648→        <p className="text-[11px] text-muted-foreground" role="status">
+  1649→          Saving…
+  1650→        </p>
+  1651→      )}
+  1652→      {selected && (
+  1653→        <p className="text-[11px] font-medium text-[color:var(--memphis-coral)]">
+  1654→          Editing — properties panel open
+  1655→        </p>
+  1656→      )}
+  1657→    </div>
+  1658→  );
+  1659→}
+  1660→

@@ -78,6 +78,14 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
 function DashboardShellInner({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
+  // The form BUILDER is a fixed-height application shell (3 panes,
+  // each scrolling independently) — it opts out of the standard
+  // padded, page-scrolling main. /dashboard/forms/new and every other
+  // route keep the standard layout.
+  const isBuilderRoute = (() => {
+    const m = pathname.match(/^\/dashboard\/forms\/([^/]+)\/?$/);
+    return m != null && m[1] !== "new";
+  })();
   const { signOut } = useAuth();
   const [mobileOpen, setMobileOpen] = useState(false);
 
@@ -138,7 +146,13 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
       {/* =============================================================== */}
       {/* Main content                                                     */}
       {/* =============================================================== */}
-      <div className="flex min-h-screen flex-col lg:pl-64">
+      <div
+        className={
+          isBuilderRoute
+            ? "flex h-dvh flex-col overflow-hidden lg:pl-64"
+            : "flex min-h-screen flex-col lg:pl-64"
+        }
+      >
         {/* Top bar */}
         <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b-2 border-foreground/10 bg-background/85 px-4 backdrop-blur-md sm:px-6 lg:h-16">
           {/* Hamburger (mobile only) */}
@@ -173,9 +187,15 @@ function DashboardShellInner({ children }: { children: React.ReactNode }) {
         </header>
 
         {/* Page content */}
-        <main className="flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-          <div className="mx-auto w-full max-w-7xl">{children}</div>
-        </main>
+        {isBuilderRoute ? (
+          <main className="flex min-h-0 flex-1 flex-col overflow-hidden">
+            {children}
+          </main>
+        ) : (
+          <main className="flex-1 px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
+            <div className="mx-auto w-full max-w-7xl">{children}</div>
+          </main>
+        )}
       </div>
     </div>
   );

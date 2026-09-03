@@ -1,48 +1,48 @@
 "use client";
 
 /**
- * FormNull — Form Builder (Phase 3)
+ * FormNull — Form Builder (Field System 2.0 shell)
  * =====================================================================
- * THE manual form builder — the product's core surface. Professional
- * 3-pane layout, Memphis-designed:
+ * THE manual form builder — the product's core surface, rebuilt as a
+ * FIXED-HEIGHT application:
  *
- *   ┌────────────────────────────────────────────────────────────┐
- *   │ toolbar: back · status · name · save-state · preview ·     │
- *   │          publish · share · more                            │
- *   ├───────────┬───────────────────────────┬────────────────────┤
- *   │ field     │ live form canvas          │ properties         │
- *   │ library   │ (what respondents see)    │ (form / field)     │
- *   └───────────┴───────────────────────────┴────────────────────┘
+ *   ┌──────────────────────────────────────────────────────────────┐
+ *   │ toolbar: back · status · name · save-state · preview · share │
+ *   ├────────┬───────────────────────────────┬─────────────────────┤
+ *   │ field  │ live form canvas              │ properties          │
+ *   │ rail   │ (own scroll context)          │ (own scroll context)│
+ *   └────────┴───────────────────────────────┴─────────────────────┘
  *
- * Tablet/mobile (< lg): canvas full-width; the field library and the
- * properties panel become Sheets. Nothing is unreachable.
+ * The three regions scroll INDEPENDENTLY — the page itself never
+ * scrolls on desktop (the dashboard shell opts this route into a
+ * full-bleed, overflow-hidden main; see dashboard-shell.tsx).
  *
- * Real Supabase persistence (unchanged contracts from Phase 2A):
+ * Field library modes (desktop lg+):
+ *   RAIL    (default) — 56px icon strip; hovering it (or opening
+ *           search) expands the full library as an overlay panel that
+ *           floats over the canvas; clicking any rail icon adds that
+ *           field type with one click.
+ *   PINNED  — the library becomes a fixed 240px pane (canvas reflows
+ *           wider). The pin preference persists per browser.
+ *
+ * Tablet/mobile (< lg): canvas fills the workspace; the library and
+ * the properties panel become Sheets. Nothing is unreachable.
+ *
+ * Real Supabase persistence (contracts unchanged since Phase 3):
  *   - Form load:      SELECT forms + form_fields (sorted by sort_order)
  *   - Form save:      UPDATE forms (name, description, settings)
  *   - Form delete:    DELETE forms (cascades fields + submissions)
  *   - Add field:      INSERT form_fields (immediate, sort_order = max+1)
  *   - Edit field:     UPDATE form_fields (explicit Save per field)
- *   - Duplicate:      INSERT form_fields (config copy, unique key)
+ *   - Duplicate:      INSERT form_fields (deep-copied config, unique key)
  *   - Delete field:   DELETE form_fields (006 keeps collected answers:
  *                     submission_values.field_id → ON DELETE SET NULL)
  *   - Reorder:        UPDATE sort_order for changed rows only, once
  *                     per drop / button press, with rollback.
  *   - Publish:        RPC publish_form (migration 006 — immutable
  *                     version snapshot + public link flip).
- *
- * No fake success: every mutation awaits the real Supabase response
- * and only updates UI state after the database confirms. Failures
- * surface real errors and preserve unsaved local work — selection
- * changes and unload are guarded while edits are pending.
- *
- * RLS: all queries run as the authenticated user — readers must be
- * workspace members, writers editors+. An unauthorized form id simply
- * returns no row ("Form not found"). publish_form re-checks editor
- * rights server-side (SECURITY DEFINER) — the button being visible
- * is never the permission boundary.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
@@ -109,17 +109,22 @@ import {
   TriangleAlert,
   Check,
   Loader2,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Search,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
-  fieldMeta,
+  fieldDef,
   fieldLabel,
   defaultConfigForType,
   MAX_FIELDS_PER_FORM,
   FIELD_LIMIT_WARN_AT,
+  FIELD_GROUPS,
+  FIELD_TYPES_BY_GROUP,
   type FieldType,
-} from "./field-types";
-import { FieldEditor } from "./field-editor";
+} from "./field-registry";
+import { FieldPropertyEditor, type FieldDraft } from "./field-property-editor";
 import { FieldLibrary } from "./field-library";
 import { FieldLabelBlock, FieldControl, toRenderableField } from "./form-renderer";
 import { PreviewDialog } from "./preview-dialog";
@@ -152,6 +157,13 @@ function uniqueKey(base: string, existing: string[]): string {
   return `${b}_${i}`;
 }
 
+/** Deep-copy a JSON-safe config (duplicate isolation — never share
+ *  object identity between the original and the copy). */
+function cloneConfig(config: Record<string, unknown> | null | undefined): Record<string, unknown> {
+  if (!config || typeof config !== "object") return {};
+  return JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
+}
+
 function statusColor(status: string): string {
   switch (status) {
     case "published":
@@ -164,6 +176,11 @@ function statusColor(status: string): string {
       return "var(--memphis-coral)";
   }
 }
+
+const PIN_PREF_KEY = "formnull.builder.libraryPinned";
+
+/** Quick-start field types offered in the empty canvas. */
+const QUICK_START: FieldType[] = ["short_text", "email", "single_select", "rating"];
 
 /* ------------------------------------------------------------------ */
 /* FormDetail (builder)                                                */
@@ -194,6 +211,9 @@ export function FormDetail({ formId }: { formId: string }) {
   const [duplicatingFieldId, setDuplicatingFieldId] = useState<string | null>(null);
   const [reorderError, setReorderError] = useState<string | null>(null);
 
+  // Library rail state
+  const [libraryPinned, setLibraryPinned] = useState(false);
+
   // Dialogs / sheets
   const [previewOpen, setPreviewOpen] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
@@ -205,6 +225,27 @@ export function FormDetail({ formId }: { formId: string }) {
   const [pendingSelection, setPendingSelection] = useState<string | null | "cancel">(null);
   const [librarySheetOpen, setLibrarySheetOpen] = useState(false);
   const [propsSheetOpen, setPropsSheetOpen] = useState(false);
+
+  // Restore the user's deliberate pin preference (per browser).
+  useEffect(() => {
+    try {
+      setLibraryPinned(window.localStorage.getItem(PIN_PREF_KEY) === "1");
+    } catch {
+      /* storage unavailable — the rail simply defaults to collapsed */
+    }
+  }, []);
+
+  function toggleLibraryPinned() {
+    setLibraryPinned((p) => {
+      const next = !p;
+      try {
+        window.localStorage.setItem(PIN_PREF_KEY, next ? "1" : "0");
+      } catch {
+        /* preference not persisted — still toggles for this session */
+      }
+      return next;
+    });
+  }
 
   const fieldIds = useMemo(() => fields.map((f) => f.id), [fields]);
   const selectedField = useMemo(
@@ -378,11 +419,11 @@ export function FormDetail({ formId }: { formId: string }) {
       });
       return;
     }
-    const meta = { type, label: fieldLabel(type) };
+    const label = fieldLabel(type);
     setAddingField(type);
     try {
       const existingKeys = fields.map((f) => f.field_key);
-      const key = uniqueKey(meta.label, existingKeys);
+      const key = uniqueKey(label, existingKeys);
       const nextOrder =
         fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
 
@@ -396,7 +437,7 @@ export function FormDetail({ formId }: { formId: string }) {
           form_id: form.id,
           field_key: key,
           field_type: type,
-          label: meta.label,
+          label,
           is_required: false,
           sort_order: nextOrder,
           width: 12,
@@ -412,7 +453,7 @@ export function FormDetail({ formId }: { formId: string }) {
       setFields((prev) => [...prev, data as FormField]);
       selectField(data.id);
       if (!isDesktop) setLibrarySheetOpen(false);
-      toast.success(`${meta.label} field added.`);
+      toast.success(`${label} field added.`);
       // Bring the new card into view (data-attr lookup — no ref plumbing).
       window.requestAnimationFrame(() => {
         document
@@ -428,18 +469,7 @@ export function FormDetail({ formId }: { formId: string }) {
     }
   }
 
-  async function saveField(
-    fieldId: string,
-    draft: {
-      label: string;
-      description: string | null;
-      placeholder: string | null;
-      help_text: string | null;
-      is_required: boolean;
-      width: number;
-      config: Record<string, unknown>;
-    },
-  ): Promise<boolean> {
+  async function saveField(fieldId: string, draft: FieldDraft): Promise<boolean> {
     setSavingFieldId(fieldId);
     const { error } = await supabaseBrowser
       .from("form_fields")
@@ -491,7 +521,9 @@ export function FormDetail({ formId }: { formId: string }) {
           is_required: field.is_required,
           width: field.width,
           sort_order: nextOrder,
-          config: { ...(field.config ?? {}) },
+          // Deep copy — the duplicate shares NO object identity with
+          // the original's config (option labels maps included).
+          config: cloneConfig(field.config),
         })
         .select()
         .single();
@@ -631,18 +663,19 @@ export function FormDetail({ formId }: { formId: string }) {
 
   const busyAny =
     savingForm || deletingForm || addingField !== null || deleteFieldBusy;
+  const libraryDisabled = addingField !== null || deletingForm || savingForm;
 
   return (
     <div
-      className="flex flex-col gap-4"
+      className="flex h-full min-h-0 flex-1 flex-col gap-3 p-3 sm:gap-4 sm:p-4 lg:p-5"
       onKeyDown={(e) => {
         if (e.key === "Escape" && selectedFieldId && e.target === e.currentTarget) {
           closeProperties();
         }
       }}
     >
-      {/* ================= Toolbar ================= */}
-      <div className="flex flex-wrap items-center gap-2 rounded-2xl border-2 border-foreground/10 bg-surface p-2.5 sm:gap-3 sm:p-3">
+      {/* ================= Toolbar (never scrolls away) ================= */}
+      <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-2xl border-2 border-foreground/10 bg-surface p-2.5 sm:gap-3 sm:p-3">
         <Button asChild variant="ghost" size="icon-sm" aria-label="Back to forms">
           <Link href="/dashboard/forms/">
             <ArrowLeft className="h-4 w-4" />
@@ -745,193 +778,163 @@ export function FormDetail({ formId }: { formId: string }) {
         </Button>
       </div>
 
-      {/* ================= 3-pane workspace ================= */}
-      <div className="flex min-h-0 flex-1 flex-col gap-4 lg:h-[calc(100vh-9rem)]">
-        <div className="flex min-h-0 flex-1 flex-col gap-4 lg:flex-row">
-          {/* ── Left: field library (lg+) ── */}
-          <aside
-            className="hidden w-52 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex xl:w-56"
-            aria-label="Field library"
-          >
-            <div className="border-b border-foreground/10 px-3 py-2.5">
-              <p className="font-display text-sm font-bold">Add fields</p>
-              <p className="text-[11px] text-muted-foreground">
-                Click to append to the form
-              </p>
-            </div>
-            <div className="min-h-0 flex-1">
-              <FieldLibrary
-                onAdd={addField}
-                disabled={addingField !== null || deletingForm || savingForm}
-                fieldCount={fields.length}
-              />
-            </div>
-          </aside>
+      {/* ================= Fixed-height workspace ================= */}
+      <div className="flex min-h-0 flex-1 gap-3 sm:gap-4">
+        {/* ── Left: field library (lg+) — rail or pinned pane ── */}
+        <LibraryPane
+          pinned={libraryPinned}
+          onTogglePin={toggleLibraryPinned}
+          onAdd={addField}
+          disabled={libraryDisabled}
+          fieldCount={fields.length}
+        />
 
-          {/* ── Center: live canvas ── */}
-          <main
-            className="min-w-0 flex-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-[color:var(--surface)]/60 p-3 sm:p-4 lg:p-5"
-            aria-label="Form canvas"
-          >
-            <div className="mx-auto w-full max-w-2xl">
-              {/* Respondent-view header (read-only preview of form intro) */}
-              <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
-                <GeometricCircle color="coral" size={32} className="-top-3 -right-3 opacity-70" />
-                <div className="relative">
-                  <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                    <Eye className="h-3 w-3" aria-hidden />
-                    Respondent view
-                  </p>
-                  <h2 className="font-display text-2xl font-bold tracking-tight text-foreground">
-                    {form.name}
-                  </h2>
-                  {form.description && (
-                    <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-                      {form.description}
-                    </p>
-                  )}
-                  <p className="mt-2.5 text-xs text-muted-foreground/80">
-                    {fields.length} field{fields.length === 1 ? "" : "s"}
-                    {submitLabel.trim() ? ` · button “${submitLabel.trim()}”` : ""}
-                  </p>
-                </div>
-              </div>
-
-              {/* Field limit warning */}
-              {fields.length >= FIELD_LIMIT_WARN_AT && (
-                <div
-                  role="status"
-                  className={cn(
-                    "mt-3 flex items-start gap-2 rounded-xl border-2 p-3 text-xs font-medium",
-                    fields.length >= MAX_FIELDS_PER_FORM
-                      ? "border-destructive/40 bg-destructive/10 text-destructive"
-                      : "border-[color:var(--memphis-sun)]/40 bg-[color:var(--memphis-sun)]/10 text-[color:var(--memphis-sun)]",
-                  )}
-                >
-                  <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-                  <span>
-                    {fields.length >= MAX_FIELDS_PER_FORM
-                      ? `Field limit reached (${fields.length}/${MAX_FIELDS_PER_FORM}) — remove fields to add more.`
-                      : `Approaching the field limit (${fields.length}/${MAX_FIELDS_PER_FORM}).`}
-                  </span>
-                </div>
-              )}
-
-              {reorderError && (
-                <p
-                  role="alert"
-                  className="mt-3 rounded-lg bg-destructive/10 p-2.5 text-xs font-medium text-destructive"
-                >
-                  {reorderError}
+        {/* ── Center: live canvas (own scroll context) ── */}
+        <main
+          className="min-w-0 flex-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-[color:var(--surface)]/60 p-3 sm:p-4 lg:p-5"
+          aria-label="Form canvas"
+        >
+          <div className="mx-auto w-full max-w-2xl">
+            {/* Respondent-view header (read-only preview of form intro) */}
+            <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 sm:p-6">
+              <GeometricCircle color="coral" size={32} className="-top-3 -right-3 opacity-70" />
+              <div className="relative">
+                <p className="mb-1 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <Eye className="h-3 w-3" aria-hidden />
+                  Respondent view
                 </p>
-              )}
-
-              {/* Field cards */}
-              {fields.length === 0 ? (
-                <div className="mt-4 rounded-2xl border-2 border-dashed border-foreground/20 p-8 text-center">
-                  <GeometricTriangle
-                    color="violet"
-                    size={20}
-                    rotate={-12}
-                    className="relative mx-auto mb-3 opacity-60"
-                  />
-                  <p className="font-display text-base font-bold">No fields yet</p>
-                  <p className="mx-auto mt-1 max-w-sm text-xs leading-relaxed text-muted-foreground">
-                    Add your first field from the library{isDesktop ? " on the left" : ""}. Every
-                    field is stored as a normalized database row — no mock data.
+                <h2 className="font-display text-2xl font-bold tracking-tight text-foreground">
+                  {form.name}
+                </h2>
+                {form.description && (
+                  <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+                    {form.description}
                   </p>
-                  <Button
-                    variant="memphis-outline"
-                    size="sm"
-                    className="mt-4 lg:hidden"
-                    onClick={() => setLibrarySheetOpen(true)}
-                    aria-label="Add your first field"
-                  >
-                    <Plus className="h-4 w-4" />
-                    Add field
-                  </Button>
-                </div>
-              ) : (
-                <DndContext
-                  sensors={sensors}
-                  collisionDetection={closestCenter}
-                  onDragEnd={handleDragEnd}
-                >
-                  <SortableContext items={fieldIds} strategy={verticalListSortingStrategy}>
-                    <ul className="mt-4 grid grid-cols-1 gap-5 sm:grid-cols-12 sm:gap-x-4">
-                      {fields.map((field, index) => (
-                        <CanvasFieldCard
-                          key={field.id}
-                          field={field}
-                          index={index}
-                          total={fields.length}
-                          selected={selectedFieldId === field.id}
-                          busy={
-                            addingField !== null ||
-                            deleteFieldBusy ||
-                            deletingForm ||
-                            savingForm
-                          }
-                          saving={savingFieldId === field.id}
-                          duplicating={duplicatingFieldId === field.id}
-                          onSelect={() =>
-                            selectField(selectedFieldId === field.id ? null : field.id)
-                          }
-                          onMove={(dir) => moveField(field.id, dir)}
-                          onDuplicate={() => duplicateField(field)}
-                          onDelete={() => setDeleteFieldTarget(field)}
-                        />
-                      ))}
-                    </ul>
-                  </SortableContext>
-                </DndContext>
-              )}
-
-              {/* Canvas footer: add field (mobile) */}
-              {fields.length > 0 && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="mt-4 w-full border-dashed lg:hidden"
-                  onClick={() => setLibrarySheetOpen(true)}
-                  disabled={busyAny}
-                  aria-label="Add another field"
-                >
-                  <Plus className="h-4 w-4" />
-                  Add field
-                </Button>
-              )}
+                )}
+                <p className="mt-2.5 text-xs text-muted-foreground/80">
+                  {fields.length} field{fields.length === 1 ? "" : "s"}
+                  {submitLabel.trim() ? ` · button “${submitLabel.trim()}”` : ""}
+                </p>
+              </div>
             </div>
-          </main>
 
-          {/* ── Right: properties (lg+) ── */}
-          <aside
-            className="hidden w-80 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex xl:w-96"
-            aria-label="Properties"
-          >
-            <PropertiesPanel
-              form={form}
-              fields={fields}
-              selectedField={selectedField}
-              savingForm={savingForm}
-              savingField={savingFieldId === selectedField?.id}
-              editorDirty={editorDirty}
-              name={name}
-              description={description}
-              submitLabel={submitLabel}
-              onName={setName}
-              onDescription={setDescription}
-              onSubmitLabel={setSubmitLabel}
-              onSaveForm={saveForm}
-              formDetailsDirty={formDetailsDirty}
-              onOpenShare={() => setShareOpen(true)}
-              onSelectField={(id) => selectField(id)}
-              onClose={closeProperties}
-              onEditorDirty={setEditorDirty}
-              onSaveField={saveField}
-            />
-          </aside>
-        </div>
+            {/* Field limit warning */}
+            {fields.length >= FIELD_LIMIT_WARN_AT && (
+              <div
+                role="status"
+                className={cn(
+                  "mt-3 flex items-start gap-2 rounded-xl border-2 p-3 text-xs font-medium",
+                  fields.length >= MAX_FIELDS_PER_FORM
+                    ? "border-destructive/40 bg-destructive/10 text-destructive"
+                    : "border-[color:var(--memphis-sun)]/40 bg-[color:var(--memphis-sun)]/10 text-[color:var(--memphis-sun)]",
+                )}
+              >
+                <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                <span>
+                  {fields.length >= MAX_FIELDS_PER_FORM
+                    ? `Field limit reached (${fields.length}/${MAX_FIELDS_PER_FORM}) — remove fields to add more.`
+                    : `Approaching the field limit (${fields.length}/${MAX_FIELDS_PER_FORM}).`}
+                </span>
+              </div>
+            )}
+
+            {reorderError && (
+              <p
+                role="alert"
+                className="mt-3 rounded-lg bg-destructive/10 p-2.5 text-xs font-medium text-destructive"
+              >
+                {reorderError}
+              </p>
+            )}
+
+            {/* Field cards */}
+            {fields.length === 0 ? (
+              <EmptyCanvas
+                onAdd={addField}
+                disabled={libraryDisabled}
+                isDesktop={isDesktop}
+                onOpenLibrary={() => setLibrarySheetOpen(true)}
+              />
+            ) : (
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                onDragEnd={handleDragEnd}
+              >
+                <SortableContext items={fieldIds} strategy={verticalListSortingStrategy}>
+                  <ul className="mt-4 grid grid-cols-1 gap-5 sm:grid-cols-12 sm:gap-x-4">
+                    {fields.map((field, index) => (
+                      <CanvasFieldCard
+                        key={field.id}
+                        field={field}
+                        index={index}
+                        total={fields.length}
+                        selected={selectedFieldId === field.id}
+                        busy={
+                          addingField !== null ||
+                          deleteFieldBusy ||
+                          deletingForm ||
+                          savingForm
+                        }
+                        saving={savingFieldId === field.id}
+                        duplicating={duplicatingFieldId === field.id}
+                        onSelect={() =>
+                          selectField(selectedFieldId === field.id ? null : field.id)
+                        }
+                        onMove={(dir) => moveField(field.id, dir)}
+                        onDuplicate={() => duplicateField(field)}
+                        onDelete={() => setDeleteFieldTarget(field)}
+                      />
+                    ))}
+                  </ul>
+                </SortableContext>
+              </DndContext>
+            )}
+
+            {/* Canvas footer: add field (mobile) */}
+            {fields.length > 0 && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="mt-4 w-full border-dashed lg:hidden"
+                onClick={() => setLibrarySheetOpen(true)}
+                disabled={busyAny}
+                aria-label="Add another field"
+              >
+                <Plus className="h-4 w-4" />
+                Add field
+              </Button>
+            )}
+          </div>
+        </main>
+
+        {/* ── Right: properties (lg+, own scroll context) ── */}
+        <aside
+          className="hidden w-80 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex xl:w-96"
+          aria-label="Properties"
+        >
+          <PropertiesPanel
+            form={form}
+            fields={fields}
+            selectedField={selectedField}
+            savingForm={savingForm}
+            savingField={savingFieldId === selectedField?.id}
+            editorDirty={editorDirty}
+            name={name}
+            description={description}
+            submitLabel={submitLabel}
+            onName={setName}
+            onDescription={setDescription}
+            onSubmitLabel={setSubmitLabel}
+            onSaveForm={saveForm}
+            formDetailsDirty={formDetailsDirty}
+            onOpenShare={() => setShareOpen(true)}
+            onSelectField={(id) => selectField(id)}
+            onClose={closeProperties}
+            onEditorDirty={setEditorDirty}
+            onSaveField={saveField}
+          />
+        </aside>
       </div>
 
       {/* ================= Tablet/mobile Sheets ================= */}
@@ -984,7 +987,7 @@ export function FormDetail({ formId }: { formId: string }) {
             </SheetHeader>
             <div className="p-4">
               {selectedField && (
-                <FieldEditor
+                <FieldPropertyEditor
                   key={selectedField.id}
                   field={selectedField}
                   saving={savingFieldId === selectedField.id}
@@ -1115,7 +1118,265 @@ export function FormDetail({ formId }: { formId: string }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Save state chip                                                      */
+/* Library pane — collapsible rail (default) or pinned panel           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The desktop field library home. Two deliberate modes:
+ *
+ *   RAIL (default) — a 56px icon strip. Hovering anywhere on it (or
+ *   pressing its search button) expands the full library as a floating
+ *   overlay beside the rail; clicking a rail icon adds that field in
+ *   one click. Escape or mouse-out collapses it again. The canvas
+ *   keeps its full width while collapsed.
+ *
+ *   PINNED — a fixed 240px pane with search, groups and descriptions.
+ *   The pin preference persists (localStorage), honoring "the user can
+ *   deliberately pin/open it".
+ */
+function LibraryPane({
+  pinned,
+  onTogglePin,
+  onAdd,
+  disabled,
+  fieldCount,
+}: {
+  pinned: boolean;
+  onTogglePin: () => void;
+  onAdd: (type: FieldType) => void;
+  disabled: boolean;
+  fieldCount: number;
+}) {
+  const [open, setOpen] = useState(false);
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimer.current) {
+      clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  }, []);
+
+  const openNow = useCallback(() => {
+    cancelClose();
+    setOpen(true);
+  }, [cancelClose]);
+
+  const scheduleClose = useCallback(() => {
+    cancelClose();
+    closeTimer.current = setTimeout(() => setOpen(false), 200);
+  }, [cancelClose]);
+
+  useEffect(() => {
+    return () => cancelClose();
+  }, [cancelClose]);
+
+  /** Open the overlay AND focus its search input (keyboard path). */
+  function openAndFocusSearch() {
+    openNow();
+    window.requestAnimationFrame(() => {
+      const el = document.querySelector(
+        'input[aria-label="Search field types"]',
+      ) as HTMLInputElement | null;
+      el?.focus();
+    });
+  }
+
+  if (pinned) {
+    return (
+      <aside
+        className="hidden w-60 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex"
+        aria-label="Field library"
+      >
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-foreground/10 px-3 py-2.5">
+          <div className="min-w-0">
+            <p className="font-display text-sm font-bold">Add fields</p>
+            <p className="text-[11px] text-muted-foreground">Click to append</p>
+          </div>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onTogglePin}
+            aria-label="Collapse field library to icon rail"
+            title="Collapse to icon rail"
+          >
+            <PanelLeftClose className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1">
+          <FieldLibrary onAdd={onAdd} disabled={disabled} fieldCount={fieldCount} />
+        </div>
+      </aside>
+    );
+  }
+
+  return (
+    <aside
+      className="relative hidden w-14 shrink-0 lg:block"
+      aria-label="Field library"
+      onMouseLeave={scheduleClose}
+    >
+      {/* ── The rail (always visible, 56px) ── */}
+      <div
+        className="flex h-full w-14 flex-col items-center gap-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-surface py-2"
+        onMouseEnter={openNow}
+      >
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={onTogglePin}
+          aria-label="Pin field library open"
+          title="Pin library open"
+        >
+          <PanelLeftOpen className="h-4 w-4" />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          onClick={openAndFocusSearch}
+          aria-label="Search field types"
+          title="Search field types"
+        >
+          <Search className="h-4 w-4" />
+        </Button>
+        <div className="my-1 h-0.5 w-6 shrink-0 rounded bg-foreground/10" aria-hidden />
+
+        {FIELD_GROUPS.map((group) => (
+          <div key={group.key} className="flex w-full flex-col items-center gap-0.5">
+            <p
+              className="mt-1 w-full text-center text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/60"
+              title={group.label}
+            >
+              {group.label}
+            </p>
+            {FIELD_TYPES_BY_GROUP[group.key].map((t) => {
+              const Icon = t.icon;
+              return (
+                <button
+                  key={t.value}
+                  type="button"
+                  onClick={() => onAdd(t.value)}
+                  disabled={disabled}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[color:var(--memphis-coral)]/12 hover:text-[color:var(--memphis-coral)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                  aria-label={`Add ${t.label} field`}
+                  title={`${t.label} — ${t.description}`}
+                >
+                  <Icon className="h-4 w-4" />
+                </button>
+              );
+            })}
+          </div>
+        ))}
+
+        <div className="mt-auto shrink-0 pt-2 text-center text-[10px] font-semibold text-muted-foreground/70">
+          {fieldCount}
+        </div>
+      </div>
+
+      {/* ── The floating overlay (hover / search / focus) ── */}
+      <div
+        role="region"
+        aria-label="Field library panel"
+        className={cn(
+          "absolute inset-y-0 left-14 z-40 flex w-64 flex-col rounded-2xl border-2 border-foreground/10 bg-surface shadow-[6px_6px_0_0_var(--memphis-ink)] transition-all duration-150",
+          open
+            ? "pointer-events-auto translate-x-0 opacity-100"
+            : "pointer-events-none -translate-x-2 opacity-0",
+        )}
+        onMouseEnter={openNow}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") {
+            e.stopPropagation();
+            setOpen(false);
+          }
+        }}
+      >
+        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-foreground/10 px-3 py-2.5">
+          <p className="font-display text-sm font-bold">Add fields</p>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            onClick={onTogglePin}
+            aria-label="Pin field library open"
+            title="Keep the library open"
+          >
+            <PanelLeftOpen className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="min-h-0 flex-1">
+          <FieldLibrary onAdd={onAdd} disabled={disabled} fieldCount={fieldCount} />
+        </div>
+      </div>
+    </aside>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Empty canvas — "add your first field" experience                    */
+/* ------------------------------------------------------------------ */
+
+function EmptyCanvas({
+  onAdd,
+  disabled,
+  isDesktop,
+  onOpenLibrary,
+}: {
+  onAdd: (type: FieldType) => void;
+  disabled: boolean;
+  isDesktop: boolean;
+  onOpenLibrary: () => void;
+}) {
+  return (
+    <div className="mt-4 rounded-2xl border-2 border-dashed border-foreground/25 p-6 text-center sm:p-8">
+      <GeometricTriangle
+        color="violet"
+        size={20}
+        rotate={-12}
+        className="relative mx-auto mb-3 opacity-60"
+      />
+      <p className="font-display text-lg font-bold">Add your first field</p>
+      <p className="mx-auto mt-1.5 max-w-sm text-xs leading-relaxed text-muted-foreground">
+        Pick a common field below, or open the full library
+        {isDesktop ? " in the rail on the left" : ""}. Every field is a real database
+        row the moment you add it.
+      </p>
+
+      <div className="mx-auto mt-5 grid max-w-xs grid-cols-2 gap-2">
+        {QUICK_START.map((type) => {
+          const def = fieldDef(type);
+          const Icon = def.icon;
+          return (
+            <button
+              key={type}
+              type="button"
+              onClick={() => onAdd(type)}
+              disabled={disabled}
+              className="flex items-center gap-2 rounded-xl border-2 border-foreground/10 bg-surface px-3 py-2.5 text-left text-sm font-semibold text-foreground transition-all hover:border-[color:var(--memphis-coral)]/50 hover:bg-[color:var(--memphis-coral)]/8 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+              aria-label={`Add ${def.label} field`}
+            >
+              <Icon className="h-4 w-4 shrink-0 text-[color:var(--memphis-coral)]" aria-hidden />
+              {def.label}
+            </button>
+          );
+        })}
+      </div>
+
+      <Button
+        variant="memphis-outline"
+        size="sm"
+        className="mt-5 lg:hidden"
+        onClick={onOpenLibrary}
+        aria-label="Browse all field types"
+      >
+        <Plus className="h-4 w-4" />
+        Browse all fields
+      </Button>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Save state chip                                                     */
 /* ------------------------------------------------------------------ */
 
 function SaveStateChip({
@@ -1162,7 +1423,7 @@ function SaveStateChip({
 }
 
 /* ------------------------------------------------------------------ */
-/* Properties panel (desktop right pane)                                */
+/* Properties panel (desktop right pane)                               */
 /* ------------------------------------------------------------------ */
 
 function PropertiesPanel({
@@ -1204,18 +1465,7 @@ function PropertiesPanel({
   onSelectField: (id: string | null) => void;
   onClose: () => void;
   onEditorDirty: (dirty: boolean) => void;
-  onSaveField: (
-    fieldId: string,
-    draft: {
-      label: string;
-      description: string | null;
-      placeholder: string | null;
-      help_text: string | null;
-      is_required: boolean;
-      width: number;
-      config: Record<string, unknown>;
-    },
-  ) => Promise<boolean>;
+  onSaveField: (fieldId: string, draft: FieldDraft) => Promise<boolean>;
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -1237,7 +1487,7 @@ function PropertiesPanel({
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         {selectedField ? (
-          <FieldEditor
+          <FieldPropertyEditor
             key={selectedField.id}
             field={selectedField}
             saving={savingField}
@@ -1344,8 +1594,8 @@ function FormSettingsView({
           </p>
           <ul className="space-y-1">
             {fields.map((f, i) => {
-              const meta = fieldMeta(f.field_type);
-              const Icon = meta?.icon;
+              const def = fieldDef(f.field_type);
+              const Icon = def.icon;
               return (
                 <li key={f.id}>
                   <button
@@ -1357,7 +1607,7 @@ function FormSettingsView({
                     <span className="w-4 shrink-0 text-[11px] text-muted-foreground">
                       {i + 1}
                     </span>
-                    {Icon ? <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden /> : null}
+                    <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
                     <span className="min-w-0 flex-1 truncate">{f.label}</span>
                     {f.is_required && (
                       <span
@@ -1424,7 +1674,7 @@ function FormSettingsView({
 }
 
 /* ------------------------------------------------------------------ */
-/* CanvasFieldCard — selectable/draggable wrapper around the field      */
+/* CanvasFieldCard — selectable/draggable wrapper around the field     */
 /* ------------------------------------------------------------------ */
 
 function CanvasFieldCard({
@@ -1455,7 +1705,7 @@ function CanvasFieldCard({
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
     useSortable({ id: field.id });
 
-  const meta = fieldMeta(field.field_type);
+  const def = fieldDef(field.field_type);
   const rf = toRenderableField(field);
   const isSection = field.field_type === "section";
 
@@ -1482,7 +1732,7 @@ function CanvasFieldCard({
           }
         }}
         aria-pressed={selected}
-        aria-label={`${selected ? "Close" : "Open"} properties for ${field.label} (${meta?.label ?? field.field_type})`}
+        aria-label={`${selected ? "Close" : "Open"} properties for ${field.label} (${def.label})`}
         className={cn(
           "group relative cursor-pointer rounded-2xl border-2 p-4 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
           isSection
@@ -1578,10 +1828,8 @@ function CanvasFieldCard({
             selected ? "opacity-100" : "opacity-0 group-hover:opacity-100",
           )}
         >
-          {meta?.icon ? (
-            <meta.icon className="h-3.5 w-3.5 text-[color:var(--memphis-coral)]" aria-hidden />
-          ) : null}
-          <span className="font-semibold">{meta?.label ?? field.field_type}</span>
+          <def.icon className="h-3.5 w-3.5 text-[color:var(--memphis-coral)]" aria-hidden />
+          <span className="font-semibold">{def.label}</span>
           <span className="font-mono opacity-70">{field.field_key}</span>
           <span className="ml-auto opacity-70">#{index + 1}</span>
         </div>

@@ -135,3 +135,21 @@ Stage Summary:
 - 6 real bugs found & fixed (infinite fetch loop, stale-draft config bleed + data repair, click-swallowing canvas, duplicate DOM ids, invisible field errors, float-step strictness); zero application console errors on stable code
 - No schema changes required; 006 untouched and fully wired; known limitations documented (no autosave by design, single-editor-per-form assumption, submitter_ip null in dev (no proxy headers) → rate limit skipped, file_upload publishable-blocked until anon storage)
 - NEXT: Phase 4 — responses browser (submissions table UI, filters, CSV export), then deferred field types (datetime/page_break/signature/address/matrix) each with full-stack support
+
+---
+Task ID: 6
+Agent: Super Z (main)
+Task: Field System 2.0 & Builder UX — PLANNING/AUDIT ONLY (no code changes; architecture for approval)
+
+Work Log:
+- Read-only audit of the full Phase 3 surface at git 6a5c07b (tree clean): form-detail.tsx (1,660L), field-types.ts (527L registry), field-editor.tsx (691L), form-renderer.tsx (854L shared renderer), field-library.tsx, preview-dialog.tsx, publish-dialog.tsx, public-form.tsx, new-form.tsx, forms-list.tsx, use-forms.ts, dashboard-shell.tsx, globals.css, lib/supabase/types.ts, migrations 002/003/006 (006 incl. publish validation + submit validation branches), page wrappers
+- Requirement conflicts CONFIRMED in code: new-form.tsx pre-seeds Name+Email default fields (L61-64) + exposes a full pre-creation field builder (duplicating slugify/uniqueKey logic from form-detail); builder is NOT fixed-height (lg:h-[calc(100vh-9rem)] magic number inside a scrolling max-w-7xl main; toolbar flex-wrap makes the calc wrong when it wraps); library pane has no collapse/icon-rail mode
+- DB capability audit: field_type enum has 21 values (5 deferred types need NO enum change); form_fields.visibility jsonb EXISTS (future Logic home, currently excluded from 006 snapshot by design); forms.settings jsonb is snapshotted + served by get_public_form → future Themes need ZERO migration; is_unique/is_searchable exist but nothing enforces them (must stay hidden in UI)
+- Key compatibility finding: publish_form validates only KNOWN config keys and passes config through wholesale into the snapshot; submit re-guards known keys only → NEW presentation-only config keys (layout/style variants) flow end-to-end (builder→snapshot→public renderer) with ZERO migration and no false validation claims — this is the honest expansion axis
+- Deferred-type migration triggers documented: page_break would inflate publish_form's usable-field count (must be excluded like section); datetime/address/matrix/ranking need submit_public_form validation branches (007 candidates — NOT proposed now); signature + publishable file_upload need anon storage + assets.owner_id redesign (3-fact analysis in 006 header)
+- Produced: Field System 2.0 architecture (schema-driven FieldTypeDef + PropertyDefinition model, 7 property groups, answerType capability map for Logic/Calc/Themes/Integrations), complete per-type property definitions for all 16 types, missing-types gap analysis with honest classification (NPS + Yes/No + layout variants shippable NOW; ranking/datetime/address/matrix/page_break deferred), fixed-height 3-pane builder UX design (rail/expand/pin, dvh, route-scoped full-bleed shell variant), 6-phase implementation plan (FS2-A..FS2-F) with dependencies + testing requirements
+- NO code modified; NO migrations created; migrations 001–006 untouched; dev server untouched
+
+Stage Summary:
+- Planning deliverable delivered in-chat for approval; next step after approval: FS2-A (empty new form) then FS2-B (fixed-height shell) per the phased plan
+- Zero migrations required for the entire Field System 2.0 scope (phases A–F); one future 007 trigger list documented for the deferred-types phase

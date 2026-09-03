@@ -1,0 +1,854 @@
+     1→"use client";
+     2→
+     3→/**
+     4→ * FormNull — Shared Form Renderer
+     5→ * =====================================================================
+     6→ * THE single rendering path for FormNull forms. One component, three
+     7→ * consumers:
+     8→ *
+     9→ *   1. Builder canvas  (mode="builder")  — inputs inert, canvas cards
+    10→ *      manage selection/reordering around them.
+    11→ *   2. Preview dialog  (mode="preview")  — fully interactive with the
+    12→ *      same validation the public form runs; submit shows a preview
+    13→ *      notice instead of persisting anything.
+    14→ *   3. Public form     (mode="public")   — /f/[key] renders the
+    15→ *      published snapshot through this exact component and submits via
+    16→ *      submit_public_form (migration 006).
+    17→ *
+    18→ * The renderer input model (`RenderableFormField`) mirrors migration
+    19→ * 006's snapshot contract 1:1 — fields are `{key, type, label,
+    20→ * description, placeholder, help_text, required, config, sort_order,
+    21→ * width}` — so builder rows and published snapshots feed the same
+    22→ * component with zero translation drift.
+    23→ *
+    24→ * ── CLIENT VALIDATION CONTRACT (mirrors 006 exactly) ─────────────────
+    25→ * `validateFieldValue` reproduces submit_public_form's per-field rules
+    26→ * (lengths, formats, ranges, option membership, step alignment, strict
+    27→ * dates). It is a UX convenience, NOT the security boundary — the
+    28→ * server re-validates everything and stores only clean, non-empty
+    29→ * answers. One deliberate client-side extension: a REQUIRED boolean
+    30→ * must be checked (006 accepts `false` as a real answer; "must be
+    31→ * checked" is the documented client UX concern). And short_text
+    32→ * `pattern` — a JavaScript regex — is enforced here by design: 006
+    33→ * documents it as client-enforced because PostgreSQL cannot evaluate
+    34→ * JS regex semantics.
+    35→ */
+    36→import { useState, type ReactNode } from "react";
+    37→import { Button } from "@/components/ui/button";
+    38→import { Input } from "@/components/ui/input";
+    39→import { Textarea } from "@/components/ui/textarea";
+    40→import { Checkbox } from "@/components/ui/checkbox";
+    41→import { Label } from "@/components/ui/label";
+    42→import {
+    43→  Select,
+    44→  SelectContent,
+    45→  SelectItem,
+    46→  SelectTrigger,
+    47→  SelectValue,
+    48→} from "@/components/ui/select";
+    49→import { Star, Upload, Info } from "lucide-react";
+    50→import { cn } from "@/lib/utils";
+    51→import type { Database, FieldType } from "@/lib/supabase/types";
+    52→
+    53→/* ------------------------------------------------------------------ */
+    54→/* Renderable model (006 snapshot contract)                            */
+    55→/* ------------------------------------------------------------------ */
+    56→
+    57→export interface RenderableFormField {
+    58→  field_key: string;
+    59→  field_type: FieldType;
+    60→  label: string;
+    61→  description?: string | null;
+    62→  placeholder?: string | null;
+    63→  help_text?: string | null;
+    64→  is_required: boolean;
+    65→  width: number;
+    66→  config: Record<string, unknown>;
+    67→  sort_order: number;
+    68→}
+    69→
+    70→export interface RenderableFormHeader {
+    71→  name: string;
+    72→  description?: string | null;
+    73→  settings?: Record<string, unknown> | null;
+    74→}
+    75→
+    76→export type FormRendererMode = "builder" | "preview" | "public";
+    77→
+    78→type FormFieldRow = Database["public"]["Tables"]["form_fields"]["Row"];
+    79→
+    80→/** DB row → renderable field (builder + preview path). */
+    81→export function toRenderableField(row: FormFieldRow): RenderableFormField {
+    82→  return {
+    83→    field_key: row.field_key,
+    84→    field_type: row.field_type,
+    85→    label: row.label,
+    86→    description: row.description,
+    87→    placeholder: row.placeholder,
+    88→    help_text: row.help_text,
+    89→    is_required: row.is_required,
+    90→    width: row.width,
+    91→    config: (row.config ?? {}) as Record<string, unknown>,
+    92→    sort_order: row.sort_order,
+    93→  };
+    94→}
+    95→
+    96→/**
+    97→ * 006 snapshot JSON → renderable model (public form path).
+    98→ * Returns null when the snapshot is structurally unusable.
+    99→ */
+   100→export function snapshotToModel(
+   101→  snapshot: Record<string, unknown> | null | undefined,
+   102→): { form: RenderableFormHeader; fields: RenderableFormField[] } | null {
+   103→  if (!snapshot || typeof snapshot !== "object") return null;
+   104→  const rawFields = snapshot.fields;
+   105→  if (!Array.isArray(rawFields)) return null;
+   106→  const fields: RenderableFormField[] = [];
+   107→  for (const f of rawFields) {
+   108→    if (!f || typeof f !== "object") return null;
+   109→    const o = f as Record<string, unknown>;
+   110→    if (typeof o.key !== "string" || typeof o.type !== "string" || typeof o.label !== "string") {
+   111→      return null;
+   112→    }
+   113→    fields.push({
+   114→      field_key: o.key,
+   115→      field_type: o.type as FieldType,
+   116→      label: o.label,
+   117→      description: typeof o.description === "string" ? o.description : null,
+   118→      placeholder: typeof o.placeholder === "string" ? o.placeholder : null,
+   119→      help_text: typeof o.help_text === "string" ? o.help_text : null,
+   120→      is_required: o.required === true,
+   121→      width: typeof o.width === "number" && o.width >= 1 && o.width <= 12 ? o.width : 12,
+   122→      config: (o.config && typeof o.config === "object" ? o.config : {}) as Record<string, unknown>,
+   123→      sort_order: typeof o.sort_order === "number" ? o.sort_order : 0,
+   124→    });
+   125→  }
+   126→  fields.sort((a, b) => a.sort_order - b.sort_order);
+   127→  return {
+   128→    form: {
+   129→      name: typeof snapshot.name === "string" ? snapshot.name : "",
+   130→      description: typeof snapshot.description === "string" ? snapshot.description : null,
+   131→      settings: (snapshot.settings && typeof snapshot.settings === "object"
+   132→        ? snapshot.settings
+   133→        : {}) as Record<string, unknown>,
+   134→    },
+   135→    fields,
+   136→  };
+   137→}
+   138→
+   139→/* ------------------------------------------------------------------ */
+   140→/* Client-side validation — mirrors submit_public_form (006)            */
+   141→/* ------------------------------------------------------------------ */
+   142→
+   143→/** Length caps from 006's constants. */
+   144→const CAPS = { email: 320, url: 2048, phone: 25, text: 10000 };
+   145→
+   146→function isBlank(v: unknown): boolean {
+   147→  return typeof v === "string" && v.trim() === "";
+   148→}
+   149→
+   150→function num(v: unknown): number | undefined {
+   151→  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+   152→}
+   153→
+   154→/**
+   155→ * Step alignment with float tolerance. PostgreSQL's NUMERIC modulo is
+   156→ * exact (19.99 % 0.01 = 0); JavaScript floats are not (0.00999...).
+   157→ * Comparing the quotient to its nearest integer keeps the client mirror
+   158→ * from being STRICTER than 006's server validation.
+   159→ */
+   160→function isStepAligned(value: number, min: number, step: number): boolean {
+   161→  const quotient = (value - min) / step;
+   162→  return Math.abs(quotient - Math.round(quotient)) < 1e-9;
+   163→}
+   164→
+   165→/**
+   166→ * Validate one answer against its field, mirroring 006. Returns an
+   167→ * error message or null. `undefined` value = no answer yet.
+   168→ */
+   169→export function validateFieldValue(
+   170→  field: RenderableFormField,
+   171→  value: unknown,
+   172→): string | null {
+   173→  const { field_type: t, is_required: req, config } = field;
+   174→
+   175→  if (value === undefined || value === null) {
+   176→    return req ? "This field is required." : null;
+   177→  }
+   178→
+   179→  switch (t) {
+   180→    case "short_text":
+   181→    case "long_text":
+   182→    case "email":
+   183→    case "url":
+   184→    case "phone": {
+   185→      if (typeof value !== "string") return "Answer must be text.";
+   186→      if (isBlank(value)) return req ? "This field is required." : null;
+   187→      const cap = t === "email" ? CAPS.email : t === "url" ? CAPS.url : t === "phone" ? CAPS.phone : CAPS.text;
+   188→      if (value.length > cap) return `Answer is too long (maximum ${cap} characters).`;
+   189→      const minL = num(config.minLength);
+   190→      const maxL = num(config.maxLength);
+   191→      if (minL !== undefined && minL >= 0 && value.length < minL) {
+   192→        return `Answer must be at least ${minL} characters.`;
+   193→      }
+   194→      if (maxL !== undefined && maxL >= 1 && value.length > maxL) {
+   195→        return `Answer must be at most ${maxL} characters.`;
+   196→      }
+   197→      if (t === "email" && !/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$/.test(value)) {
+   198→        return "Enter a valid email address.";
+   199→      }
+   200→      if (t === "url" && (!/^https?:\/\//.test(value) || /\s/.test(value))) {
+   201→        return "Enter a valid URL (starting with http:// or https://).";
+   202→      }
+   203→      if (t === "phone" && !/^[+]?[0-9(). -]{5,25}$/.test(value)) {
+   204→        return "Enter a valid phone number (5-25 characters, digits and + ( ) . -).";
+   205→      }
+   206→      if (t === "short_text" && typeof config.pattern === "string" && config.pattern) {
+   207→        try {
+   208→          if (!new RegExp(config.pattern).test(value)) {
+   209→            return "Answer does not match the required pattern.";
+   210→          }
+   211→        } catch {
+   212→          /* invalid pattern is a builder-side concern (validateConfig);
+   213→             never crash the respondent's form over it */
+   214→        }
+   215→      }
+   216→      return null;
+   217→    }
+   218→
+   219→    case "number":
+   220→    case "decimal": {
+   221→      if (typeof value !== "number" || !Number.isFinite(value)) return "Answer must be a number.";
+   222→      if (t === "number" && !Number.isInteger(value)) return "Answer must be a whole number.";
+   223→      const min = num(config.min);
+   224→      const max = num(config.max);
+   225→      const step = num(config.step);
+   226→      if (min !== undefined && value < min) return `Answer must be ${min} or more.`;
+   227→      if (max !== undefined && value > max) return `Answer must be ${max} or less.`;
+   228→      if (step !== undefined && step > 0) {
+   229→        if (min !== undefined) {
+   230→          if (!isStepAligned(value, min, step)) {
+   231→            return `Answer must advance in steps of ${step} from ${min}.`;
+   232→          }
+   233→        } else if (!isStepAligned(value, 0, step)) {
+   234→          return `Answer must be a multiple of ${step}.`;
+   235→        }
+   236→      }
+   237→      return null;
+   238→    }
+   239→
+   240→    case "boolean": {
+   241→      if (typeof value !== "boolean") return "Answer must be true or false.";
+   242→      // Required checkbox must be CHECKED (client UX concern — see
+   243→      // module docs; the server accepts an explicit false).
+   244→      if (req && value !== true) return "This field is required.";
+   245→      return null;
+   246→    }
+   247→
+   248→    case "date": {
+   249→      if (typeof value !== "string") return "Answer must be a date.";
+   250→      if (isBlank(value)) return req ? "This field is required." : null;
+   251→      if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return "Use the YYYY-MM-DD date format.";
+   252→      const d = new Date(`${value}T00:00:00Z`);
+   253→      if (Number.isNaN(d.getTime())) return "Enter a real calendar date.";
+   254→      return null;
+   255→    }
+   256→
+   257→    case "time": {
+   258→      if (typeof value !== "string") return "Answer must be a time.";
+   259→      if (isBlank(value)) return req ? "This field is required." : null;
+   260→      if (!/^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/.test(value)) {
+   261→        return "Use the HH:MM or HH:MM:SS 24-hour format.";
+   262→      }
+   263→      return null;
+   264→    }
+   265→
+   266→    case "single_select": {
+   267→      if (typeof value !== "string") return "Choose one of the options.";
+   268→      if (isBlank(value)) return req ? "This field is required." : null;
+   269→      const options = Array.isArray(config.options) ? (config.options as unknown[]) : [];
+   270→      if (!options.some((o) => o === value)) return "Not one of the offered options.";
+   271→      return null;
+   272→    }
+   273→
+   274→    case "multi_select": {
+   275→      if (!Array.isArray(value)) return "Answer must be a list of options.";
+   276→      if (value.length === 0) return req ? "This field is required." : null;
+   277→      const options = Array.isArray(config.options) ? (config.options as unknown[]) : [];
+   278→      const seen = new Set<string>();
+   279→      for (const v of value) {
+   280→        if (typeof v !== "string" || !options.some((o) => o === v)) {
+   281→          return "One or more selections are not offered options.";
+   282→        }
+   283→        if (seen.has(v)) return "Do not select the same option twice.";
+   284→        seen.add(v);
+   285→      }
+   286→      return null;
+   287→    }
+   288→
+   289→    case "rating": {
+   290→      if (typeof value !== "number" || !Number.isFinite(value)) return "Answer must be a number.";
+   291→      const cfgMax = num(config.max);
+   292→      const max = cfgMax !== undefined && cfgMax >= 2 && cfgMax <= 10 && Number.isInteger(cfgMax) ? cfgMax : 5;
+   293→      if (!Number.isInteger(value) || value < 1 || value > max) {
+   294→        return `Answer must be a whole number between 1 and ${max}.`;
+   295→      }
+   296→      return null;
+   297→    }
+   298→
+   299→    case "scale": {
+   300→      if (typeof value !== "number" || !Number.isFinite(value)) return "Answer must be a number.";
+   301→      const cMin = num(config.min);
+   302→      const cMax = num(config.max);
+   303→      const cStep = num(config.step);
+   304→      const min = cMin !== undefined ? cMin : 1;
+   305→      const max = cMax !== undefined ? cMax : 10;
+   306→      const step = cStep !== undefined && cStep > 0 ? cStep : 1;
+   307→      if (value < min || value > max) return `Answer must be between ${min} and ${max}.`;
+   308→      if (!isStepAligned(value, min, step)) {
+   309→        return `Answer must advance in steps of ${step} from ${min}.`;
+   310→      }
+   311→      return null;
+   312→    }
+   313→
+   314→    default:
+   315→      return null;
+   316→  }
+   317→}
+   318→
+   319→/** Validate every field; returns per-key errors (only failing keys). */
+   320→export function validateAllValues(
+   321→  fields: RenderableFormField[],
+   322→  values: Record<string, unknown>,
+   323→): Record<string, string> {
+   324→  const errors: Record<string, string> = {};
+   325→  for (const f of fields) {
+   326→    const err = validateFieldValue(f, values[f.field_key]);
+   327→    if (err) errors[f.field_key] = err;
+   328→  }
+   329→  return errors;
+   330→}
+   331→
+   332→/* ------------------------------------------------------------------ */
+   333→/* Field control — one visual input per type                           */
+   334→/* ------------------------------------------------------------------ */
+   335→
+   336→export function FieldControl({
+   337→  field,
+   338→  value,
+   339→  onChange,
+   340→  disabled,
+   341→  id: idOverride,
+   342→}: {
+   343→  field: RenderableFormField;
+   344→  value: unknown;
+   345→  onChange: (v: unknown) => void;
+   346→  disabled: boolean;
+   347→  /** Unique input id — derived from idPrefix by FieldRenderer so the
+   348→      canvas, preview and public page never collide on the same DOM id. */
+   349→  id?: string;
+   350→}) {
+   351→  const t = field.field_type;
+   352→  const id = idOverride ?? `fld-${field.field_key}`;
+   353→  const cfg = field.config ?? {};
+   354→
+   355→  switch (t) {
+   356→    case "short_text":
+   357→      return (
+   358→        <Input
+   359→          id={id}
+   360→          type="text"
+   361→          value={typeof value === "string" ? value : ""}
+   362→          onChange={(e) => onChange(e.target.value)}
+   363→          placeholder={field.placeholder ?? undefined}
+   364→          disabled={disabled}
+   365→          maxLength={CAPS.text}
+   366→        />
+   367→      );
+   368→
+   369→    case "email":
+   370→    case "url":
+   371→    case "phone":
+   372→      return (
+   373→        <Input
+   374→          id={id}
+   375→          type={t === "email" ? "email" : t === "url" ? "url" : "tel"}
+   376→          value={typeof value === "string" ? value : ""}
+   377→          onChange={(e) => onChange(e.target.value)}
+   378→          placeholder={field.placeholder ?? undefined}
+   379→          disabled={disabled}
+   380→          maxLength={t === "email" ? CAPS.email : t === "url" ? CAPS.url : CAPS.phone}
+   381→        />
+   382→      );
+   383→
+   384→    case "long_text": {
+   385→      const rows = (() => {
+   386→        const r = typeof cfg.rows === "number" ? cfg.rows : 4;
+   387→        return r >= 2 && r <= 10 ? Math.round(r) : 4;
+   388→      })();
+   389→      return (
+   390→        <Textarea
+   391→          id={id}
+   392→          rows={rows}
+   393→          value={typeof value === "string" ? value : ""}
+   394→          onChange={(e) => onChange(e.target.value)}
+   395→          placeholder={field.placeholder ?? undefined}
+   396→          disabled={disabled}
+   397→          maxLength={CAPS.text}
+   398→        />
+   399→      );
+   400→    }
+   401→
+   402→    case "number":
+   403→    case "decimal": {
+   404→      const min = typeof cfg.min === "number" ? cfg.min : undefined;
+   405→      const max = typeof cfg.max === "number" ? cfg.max : undefined;
+   406→      const step =
+   407→        typeof cfg.step === "number" && cfg.step > 0 ? cfg.step : t === "decimal" ? "any" : 1;
+   408→      return (
+   409→        <Input
+   410→          id={id}
+   411→          type="number"
+   412→          value={value === undefined ? "" : String(value)}
+   413→          onChange={(e) => onChange(e.target.value === "" ? undefined : Number(e.target.value))}
+   414→          placeholder={field.placeholder ?? undefined}
+   415→          disabled={disabled}
+   416→          min={min}
+   417→          max={max}
+   418→          step={step}
+   419→        />
+   420→      );
+   421→    }
+   422→
+   423→    case "boolean":
+   424→      return (
+   425→        <div className="flex items-center gap-2.5 pt-1">
+   426→          <Checkbox
+   427→            id={id}
+   428→            checked={value === true}
+   429→            onCheckedChange={(v) => onChange(v === true)}
+   430→            disabled={disabled}
+   431→            aria-required={field.is_required}
+   432→          />
+   433→          <Label htmlFor={id} className="cursor-pointer text-sm font-normal text-muted-foreground">
+   434→            {field.help_text ?? "Check to agree"}
+   435→          </Label>
+   436→        </div>
+   437→      );
+   438→
+   439→    case "date":
+   440→      return (
+   441→        <Input
+   442→          id={id}
+   443→          type="date"
+   444→          value={typeof value === "string" ? value : ""}
+   445→          onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
+   446→          disabled={disabled}
+   447→        />
+   448→      );
+   449→
+   450→    case "time":
+   451→      return (
+   452→        <Input
+   453→          id={id}
+   454→          type="time"
+   455→          value={typeof value === "string" ? value : ""}
+   456→          onChange={(e) => onChange(e.target.value === "" ? undefined : e.target.value)}
+   457→          disabled={disabled}
+   458→        />
+   459→      );
+   460→
+   461→    case "single_select": {
+   462→      const options = Array.isArray(cfg.options) ? (cfg.options as unknown[]).filter((o) => typeof o === "string") : [];
+   463→      return (
+   464→        <Select
+   465→          value={typeof value === "string" ? value : undefined}
+   466→          onValueChange={(v) => onChange(v)}
+   467→          disabled={disabled}
+   468→        >
+   469→          <SelectTrigger id={id} aria-required={field.is_required}>
+   470→            <SelectValue placeholder={field.placeholder ?? "Choose an option"} />
+   471→          </SelectTrigger>
+   472→          <SelectContent>
+   473→            {options.map((o) => (
+   474→              <SelectItem key={String(o)} value={String(o)}>
+   475→                {String(o)}
+   476→              </SelectItem>
+   477→            ))}
+   478→          </SelectContent>
+   479→        </Select>
+   480→      );
+   481→    }
+   482→
+   483→    case "multi_select": {
+   484→      const options = Array.isArray(cfg.options) ? (cfg.options as unknown[]).filter((o) => typeof o === "string") : [];
+   485→      const selected = Array.isArray(value) ? (value as unknown[]).filter((v) => typeof v === "string") : [];
+   486→      return (
+   487→        <div className="space-y-2" role="group" aria-label={field.label}>
+   488→          {options.map((o) => {
+   489→            const opt = String(o);
+   490→            const checked = selected.includes(opt);
+   491→            return (
+   492→              <label
+   493→                key={opt}
+   494→                className="flex cursor-pointer items-center gap-2.5 rounded-lg border border-foreground/10 bg-background px-3 py-2 text-sm transition-colors hover:border-foreground/25"
+   495→              >
+   496→                <Checkbox
+   497→                  checked={checked}
+   498→                  onCheckedChange={(v) => {
+   499→                    if (disabled) return;
+   500→                    onChange(v === true ? [...selected, opt] : selected.filter((s) => s !== opt));
+   501→                  }}
+   502→                  disabled={disabled}
+   503→                  aria-label={opt}
+   504→                />
+   505→                <span>{opt}</span>
+   506→              </label>
+   507→            );
+   508→          })}
+   509→        </div>
+   510→      );
+   511→    }
+   512→
+   513→    case "rating": {
+   514→      const max = (() => {
+   515→        const m = typeof cfg.max === "number" ? cfg.max : 5;
+   516→        return m >= 2 && m <= 10 && Number.isInteger(m) ? Math.round(m) : 5;
+   517→      })();
+   518→      const current = typeof value === "number" ? value : 0;
+   519→      return (
+   520→        <div className="flex items-center gap-1 pt-1" role="group" aria-label={field.label}>
+   521→          {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+   522→            <button
+   523→              key={n}
+   524→              type="button"
+   525→              onClick={() => onChange(n === current ? undefined : n)}
+   526→              disabled={disabled}
+   527→              aria-label={`Rate ${n} out of ${max}`}
+   528→              aria-pressed={current === n}
+   529→              className={cn(
+   530→                "rounded-md p-1 transition-transform hover:scale-110 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+   531→                n <= current ? "text-[color:var(--memphis-sun)]" : "text-muted-foreground/30",
+   532→              )}
+   533→            >
+   534→              <Star className={cn("h-6 w-6", n <= current && "fill-current")} />
+   535→            </button>
+   536→          ))}
+   537→          {current > 0 && (
+   538→            <span className="ml-2 text-sm font-semibold text-muted-foreground" aria-live="polite">
+   539→              {current}/{max}
+   540→            </span>
+   541→          )}
+   542→        </div>
+   543→      );
+   544→    }
+   545→
+   546→    case "scale": {
+   547→      const min = typeof cfg.min === "number" ? cfg.min : 1;
+   548→      const max = typeof cfg.max === "number" ? cfg.max : 10;
+   549→      const step = typeof cfg.step === "number" && cfg.step > 0 ? cfg.step : 1;
+   550→      const leftLabel = typeof cfg.leftLabel === "string" ? cfg.leftLabel : null;
+   551→      const rightLabel = typeof cfg.rightLabel === "string" ? cfg.rightLabel : null;
+   552→      const steps: number[] = [];
+   553→      for (let v = min; v <= max + 1e-9; v += step) steps.push(Number(v.toFixed(6)));
+   554→      const current = typeof value === "number" ? value : undefined;
+   555→
+   556→      // Compact segmented control for small step counts; a slider for
+   557→      // large ones (keeps wide scales usable on phones).
+   558→      if (steps.length <= 12) {
+   559→        return (
+   560→          <div className="space-y-1.5">
+   561→            <div className="flex flex-wrap gap-1.5" role="group" aria-label={field.label}>
+   562→              {steps.map((v) => (
+   563→                <button
+   564→                  key={v}
+   565→                  type="button"
+   566→                  onClick={() => onChange(current === v ? undefined : v)}
+   567→                  disabled={disabled}
+   568→                  aria-pressed={current === v}
+   569→                  className={cn(
+   570→                    "h-9 min-w-9 rounded-lg border-2 px-2.5 text-sm font-semibold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+   571→                    current === v
+   572→                      ? "border-foreground bg-foreground text-background"
+   573→                      : "border-foreground/15 bg-background text-foreground/70 hover:border-foreground/40",
+   574→                  )}
+   575→                >
+   576→                  {v}
+   577→                </button>
+   578→              ))}
+   579→            </div>
+   580→            {(leftLabel || rightLabel) && (
+   581→              <div className="flex justify-between text-xs text-muted-foreground">
+   582→                <span>{leftLabel}</span>
+   583→                <span>{rightLabel}</span>
+   584→              </div>
+   585→            )}
+   586→          </div>
+   587→        );
+   588→      }
+   589→      return (
+   590→        <div className="space-y-1.5">
+   591→          <div className="flex items-center gap-3">
+   592→            {leftLabel && <span className="text-xs text-muted-foreground">{leftLabel}</span>}
+   593→            <input
+   594→              type="range"
+   595→              min={min}
+   596→              max={max}
+   597→              step={step}
+   598→              value={current ?? min}
+   599→              onChange={(e) => onChange(Number(e.target.value))}
+   600→              disabled={disabled}
+   601→              aria-label={field.label}
+   602→              className="h-2 flex-1 cursor-pointer accent-[color:var(--memphis-coral)]"
+   603→            />
+   604→            {rightLabel && <span className="text-xs text-muted-foreground">{rightLabel}</span>}
+   605→          </div>
+   606→          <p className="text-sm font-semibold text-foreground" aria-live="polite">
+   607→            {current !== undefined ? current : "—"}
+   608→          </p>
+   609→        </div>
+   610→      );
+   611→    }
+   612→
+   613→    case "file_upload": {
+   614→      const types = Array.isArray(cfg.allowedTypes) ? (cfg.allowedTypes as string[]).join(", ") : null;
+   615→      const maxSize = typeof cfg.maxSizeMb === "number" ? cfg.maxSizeMb : null;
+   616→      return (
+   617→        <div className="rounded-xl border-2 border-dashed border-foreground/20 bg-background/60 p-4 text-center">
+   618→          <Upload className="mx-auto h-5 w-5 text-muted-foreground/60" aria-hidden />
+   619→          <p className="mt-1.5 text-sm font-medium text-foreground/80">File upload</p>
+   620→          <p className="text-xs text-muted-foreground">
+   621→            {types ? `${types} · ` : ""}
+   622→            {maxSize ? `up to ${maxSize} MB · ` : ""}
+   623→            not available yet
+   624→          </p>
+   625→        </div>
+   626→      );
+   627→    }
+   628→
+   629→    case "section":
+   630→      return null; // layout-only — rendered by FieldRenderer itself
+   631→
+   632→    default:
+   633→      return null;
+   634→  }
+   635→}
+   636→
+   637→/* ------------------------------------------------------------------ */
+   638→/* FieldLabelBlock — shared label/description/help/error chrome        */
+   639→/* ------------------------------------------------------------------ */
+   640→
+   641→export function FieldLabelBlock({
+   642→  field,
+   643→  error,
+   644→  htmlFor,
+   645→}: {
+   646→  field: RenderableFormField;
+   647→  error?: string;
+   648→  htmlFor: string;
+   649→}) {
+   650→  const showHelp = field.field_type !== "boolean" && field.help_text;
+   651→  return (
+   652→    <div className="space-y-1.5">
+   653→      <Label htmlFor={htmlFor} className="text-sm font-semibold text-foreground">
+   654→        {field.label}
+   655→        {field.is_required && (
+   656→          <span className="ml-0.5 text-[color:var(--memphis-coral)]" aria-label="required">
+   657→            *
+   658→          </span>
+   659→        )}
+   660→      </Label>
+   661→      {field.description && (
+   662→        <p className="text-xs leading-relaxed text-muted-foreground">{field.description}</p>
+   663→      )}
+   664→      {showHelp && <p className="text-xs text-muted-foreground/80">{field.help_text}</p>}
+   665→      {error && (
+   666→        <p className="text-xs font-medium text-destructive" role="alert">
+   667→          {error}
+   668→        </p>
+   669→      )}
+   670→    </div>
+   671→  );
+   672→}
+   673→
+   674→/* ------------------------------------------------------------------ */
+   675→/* FieldRenderer — label + control + help + error                      */
+   676→/* ------------------------------------------------------------------ */
+   677→
+   678→export function FieldRenderer({
+   679→  field,
+   680→  value,
+   681→  error,
+   682→  onChange,
+   683→  mode,
+   684→  idPrefix = "",
+   685→}: {
+   686→  field: RenderableFormField;
+   687→  value: unknown;
+   688→  error?: string;
+   689→  onChange: (v: unknown) => void;
+   690→  mode: FormRendererMode;
+   691→  /** Prepended to every input id — keeps canvas/preview/public DOM ids unique. */
+   692→  idPrefix?: string;
+   693→}) {
+   694→  // Section: a layout divider, never a data field. Always full width.
+   695→  if (field.field_type === "section") {
+   696→    return (
+   697→      <div className="form-field-cell py-2" style={{ "--field-w": 12 } as React.CSSProperties}>
+   698→        <div className="flex items-center gap-2.5">
+   699→          <span className="inline-block h-2.5 w-2.5 rotate-45 bg-[color:var(--memphis-coral)]" aria-hidden />
+   700→          <h3 className="font-display text-lg font-bold text-foreground">{field.label}</h3>
+   701→        </div>
+   702→        {field.description && (
+   703→          <p className="mt-1 text-sm text-muted-foreground">{field.description}</p>
+   704→        )}
+   705→        {field.help_text && (
+   706→          <p className="mt-0.5 text-xs text-muted-foreground/80">{field.help_text}</p>
+   707→        )}
+   708→      </div>
+   709→    );
+   710→  }
+   711→
+   712→  const id = `${idPrefix}fld-${field.field_key}`;
+   713→
+   714→  return (
+   715→    <div
+   716→      className="form-field-cell"
+   717→      style={{ "--field-w": field.width } as React.CSSProperties}
+   718→    >
+   719→      <div className="space-y-1.5">
+   720→        <FieldLabelBlock field={field} error={error} htmlFor={id} />
+   721→        <FieldControl
+   722→          field={field}
+   723→          value={value}
+   724→          onChange={onChange}
+   725→          disabled={mode === "builder"}
+   726→          id={id}
+   727→        />
+   728→      </div>
+   729→    </div>
+   730→  );
+   731→}
+   732→
+   733→/* ------------------------------------------------------------------ */
+   734→/* FormRenderer — the whole form                                       */
+   735→/* ------------------------------------------------------------------ */
+   736→
+   737→export function FormRenderer({
+   738→  form,
+   739→  fields,
+   740→  mode,
+   741→  onSubmit,
+   742→  submitting = false,
+   743→  submitNotice,
+   744→  className,
+   745→  children,
+   746→  idPrefix = "",
+   747→}: {
+   748→  form: RenderableFormHeader;
+   749→  fields: RenderableFormField[];
+   750→  mode: FormRendererMode;
+   751→  /** Called with the validated answers (public: persist; preview: notice). */
+   752→  onSubmit?: (values: Record<string, unknown>) => void | Promise<void>;
+   753→  submitting?: boolean;
+   754→  /** Extra content under the submit button (public page uses it). */
+   755→  submitNotice?: ReactNode;
+   756→  className?: string;
+   757→  children?: ReactNode;
+   758→  /** Prepended to every input id — keeps DOM ids unique per context. */
+   759→  idPrefix?: string;
+   760→}) {
+   761→  const [values, setValues] = useState<Record<string, unknown>>({});
+   762→  const [errors, setErrors] = useState<Record<string, string>>({});
+   763→  const [showErrors, setShowErrors] = useState(false);
+   764→
+   765→  const submitLabel =
+   766→    typeof form.settings?.submit_button_label === "string" && form.settings.submit_button_label.trim()
+   767→      ? form.settings.submit_button_label.trim().slice(0, 40)
+   768→      : "Submit";
+   769→
+   770→  function setValue(key: string, v: unknown) {
+   771→    setValues((prev) => {
+   772→      const next = { ...prev };
+   773→      if (v === undefined) delete next[key];
+   774→      else next[key] = v;
+   775→      return next;
+   776→    });
+   777→    if (showErrors) {
+   778→      const field = fields.find((f) => f.field_key === key);
+   779→      if (field) {
+   780→        const err = validateFieldValue(field, v);
+   781→        setErrors((prev) => {
+   782→          const next = { ...prev };
+   783→          if (err) next[key] = err;
+   784→          else delete next[key];
+   785→          return next;
+   786→        });
+   787→      }
+   788→    }
+   789→  }
+   790→
+   791→  async function handleSubmit(e: React.FormEvent) {
+   792→    e.preventDefault();
+   793→    if (mode === "builder" || !onSubmit) return;
+   794→    const errs = validateAllValues(fields, values);
+   795→    setShowErrors(true);
+   796→    setErrors(errs);
+   797→    const errorKeys = Object.keys(errs);
+   798→    if (errorKeys.length > 0) {
+   799→      // Focus the first failing field for keyboard/screen-reader users.
+   800→      const el = document.getElementById(`${idPrefix}fld-${errorKeys[0]}`);
+   801→      el?.focus?.();
+   802→      return;
+   803→    }
+   804→    await onSubmit(values);
+   805→  }
+   806→
+   807→  const sorted = [...fields].sort((a, b) => a.sort_order - b.sort_order);
+   808→  const errorCount = Object.keys(errors).length;
+   809→
+   810→  return (
+   811→    <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
+   812→      {/* Form header — what respondents see */}
+   813→      <header className="mb-6">
+   814→        <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
+   815→          {form.name}
+   816→        </h2>
+   817→        {form.description && (
+   818→          <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{form.description}</p>
+   819→        )}
+   820→      </header>
+   821→
+   822→      <div className="grid grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-12">
+   823→        {sorted.map((field) => (
+   824→          <FieldRenderer
+   825→            key={field.field_key}
+   826→            field={field}
+   827→            value={values[field.field_key]}
+   828→            error={showErrors ? errors[field.field_key] : undefined}
+   829→            onChange={(v) => setValue(field.field_key, v)}
+   830→            mode={mode}
+   831→            idPrefix={idPrefix}
+   832→          />
+   833→        ))}
+   834→      </div>
+   835→
+   836→      {children}
+   837→
+   838→      {mode !== "builder" && onSubmit && (
+   839→        <div className="mt-8 space-y-3">
+   840→          {showErrors && errorCount > 0 && (
+   841→            <p className="text-sm font-medium text-destructive" role="alert">
+   842→              {errorCount} answer{errorCount === 1 ? "" : "s"} need{errorCount === 1 ? "s" : ""} attention.
+   843→            </p>
+   844→          )}
+   845→          <Button type="submit" variant="memphis-coral" size="lg" disabled={submitting} className="w-full sm:w-auto">
+   846→            {submitting ? "Submitting…" : submitLabel}
+   847→          </Button>
+   848→          {submitNotice}
+   849→        </div>
+   850→      )}
+   851→    </form>
+   852→  );
+   853→}
+   854→

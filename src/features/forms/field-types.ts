@@ -112,6 +112,27 @@ export function fieldLabel(type: FieldType): string {
   return fieldMeta(type)?.label ?? type;
 }
 
+/**
+ * Default config for a newly created field of this type.
+ *
+ * Centralized so EVERY creation path (new-form initial fields, the
+ * builder's "Add field" palette) writes the same config shape — no
+ * duplicated per-callsite defaults. Select-like types MUST start with a
+ * valid options array: validateConfig() rejects an empty/missing options
+ * list, and submission rendering depends on it.
+ */
+export function defaultConfigForType(type: FieldType): Record<string, unknown> {
+  switch (type) {
+    case "single_select":
+    case "multi_select":
+      return { options: ["Option 1", "Option 2"] };
+    case "rating":
+      return { max: 5 };
+    default:
+      return {};
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* Validation                                                          */
 /* ------------------------------------------------------------------ */

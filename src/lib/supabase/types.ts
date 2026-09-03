@@ -282,6 +282,16 @@ export interface Database {
     };
     Views: Record<string, never>;
     Functions: {
+      /**
+       * Atomic workspace creation (migration 005).
+       * SECURITY DEFINER RPC: inserts workspace + owner membership in one
+       * transaction. Only takes a name/description — the owner is always
+       * auth.uid(), so cross-tenant membership creation is impossible.
+       */
+      create_workspace: {
+        Args: { p_name: string; p_description?: string | null };
+        Returns: Database["public"]["Tables"]["workspaces"]["Row"];
+      };
       fn_user_workspace_role: {
         Args: { p_workspace_id: string };
         Returns: WorkspaceRole | null;

@@ -1,7 +1,17 @@
 #!/bin/bash
 # Phase 2 audit: dump live DB state via Supabase REST (service key)
-URL="https://sqtolkfjnskyxnltuyci.supabase.co"
-KEY="REDACTED_SUPABASE_SECRET_KEY"
+# Credentials come from the environment / .env.local — never hardcoded.
+# Auto-load .env.local from the project root when present (already-exported
+# vars are NOT overridden because we source it only for unset values).
+set -euo pipefail
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [ -f "$PROJECT_ROOT/.env.local" ]; then
+  set -a
+  . "$PROJECT_ROOT/.env.local"
+  set +a
+fi
+URL="${NEXT_PUBLIC_SUPABASE_URL:?NEXT_PUBLIC_SUPABASE_URL not set — export it or create .env.local}"
+KEY="${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY not set — export it or create .env.local}"
 
 q() {
   echo "--- $1 ---"

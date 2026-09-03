@@ -61,8 +61,8 @@ interface WorkspaceContextValue {
   setWorkspace: (workspaceId: string) => Promise<void>;
   /**
    * Create a new workspace owned by the current user and switch to it.
-   * Real INSERT into public.workspaces + public.workspace_members,
-   * guarded by RLS (owner_id = auth.uid()).
+   * Calls the create_workspace RPC (migration 005): one atomic transaction
+   * inserts the workspace + owner membership — no orphan rows possible.
    */
   createWorkspace: (name: string, description?: string) => Promise<Workspace | null>;
   /** Re-fetch memberships + workspaces from Supabase. */
@@ -84,17 +84,6 @@ const WorkspaceContext = createContext<WorkspaceContextValue>({
   reload: async () => {},
   switching: false,
 });
-
-function slugify(name: string): string {
-  return (
-    name
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 60) || "workspace"
-  );
-}
 
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const { user, loading: authLoading } = useAuth();
@@ -256,32 +245,23 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
       }
       setSwitching(true);
       try {
-        // 1. Insert workspace (RLS: owner_id must be auth.uid()).
-        const { data: ws, error: wsError } = await supabaseBrowser
-          .from("workspaces")
-          .insert({
-            slug: slugify(trimmed) + "-" + Math.random().toString(36).slice(2, 6),
-            name: trimmed,
-            description: description?.trim() || null,
-            owner_id: user.id,
-          })
-          .select()
-          .single();
-        if (wsError) throw wsError;
+        // Atomic creation via the SECURITY DEFINER RPC (migration 005).
+        // The RPC inserts the workspace AND the owner membership in ONE
+        // transaction, so the circular-RLS bootstrap deadlock (workspace
+        // insert succeeds → membership insert blocked by wm_insert_admin
+        // because no membership exists yet) cannot occur, and an orphan
+        // workspace row is impossible. The RPC derives the owner from
+        // auth.uid() — it accepts no workspace/user ids, so cross-tenant
+        // membership creation is structurally impossible.
+        // NOTE: requires migration 005 to be applied to the live DB.
+        const { data: ws, error: rpcError } = await supabaseBrowser.rpc(
+          "create_workspace",
+          { p_name: trimmed, p_description: description?.trim() || null },
+        );
+        if (rpcError) throw rpcError;
         if (!ws) throw new Error("Workspace creation returned no row.");
 
-        // 2. Owner membership (RLS: admins may insert members).
-        const { error: memberError } = await supabaseBrowser
-          .from("workspace_members")
-          .insert({ workspace_id: ws.id, user_id: user.id, role: "owner" });
-        if (memberError) {
-          // Workspace exists but membership failed → clean up the orphan
-          // so the user doesn't end up with an invisible workspace.
-          await supabaseBrowser.from("workspaces").delete().eq("id", ws.id);
-          throw memberError;
-        }
-
-        // 3. Update local state + persist as default.
+        // Update local state from the row the database just confirmed.
         setWorkspaces((prev) => [...prev, ws]);
         setMemberships((prev) => [
           ...prev,
@@ -297,12 +277,21 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           },
         ]);
         setActiveId(ws.id);
+
+        // Persist the new workspace as the profile default (own-profile
+        // update — allowed by profiles_update_own). Failure here does NOT
+        // undo the creation: workspace + membership already exist.
         const { error: updateError } = await supabaseBrowser
           .from("profiles")
           .update({ default_workspace_id: ws.id })
           .eq("id", user.id);
-        if (updateError) throw updateError;
-        setInitialProfileDefault(ws.id);
+        if (updateError) {
+          toast.error("Workspace created, but couldn't make it your default.", {
+            description: updateError.message,
+          });
+        } else {
+          setInitialProfileDefault(ws.id);
+        }
 
         toast.success("Workspace created!", { description: `Switched to ${trimmed}.` });
         return ws;

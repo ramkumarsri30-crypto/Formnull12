@@ -16,6 +16,11 @@ import {
 } from "@/components/memphis/memphis-decorations";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import type { FieldType } from "@/lib/supabase/types";
+import {
+  FIELD_TYPE_REGISTRY,
+  fieldMeta,
+  defaultConfigForType,
+} from "@/features/forms/field-types";
 
 /**
  * New Form page.
@@ -27,19 +32,12 @@ import type { FieldType } from "@/lib/supabase/types";
  *
  * Phase 2 will add the full drag-and-drop builder with field reordering,
  * conditional logic, and per-field validation rules.
+ *
+ * Field types come from the CENTRALIZED 16-type registry
+ * (src/features/forms/field-types.ts) — never a local copy — and every
+ * field row is created with the registry's type-appropriate default
+ * config, so select-like fields start with a valid `options` array.
  */
-const FIELD_TYPES: { value: FieldType; label: string; icon: string }[] = [
-  { value: "short_text", label: "Short text", icon: "T" },
-  { value: "long_text", label: "Long text", icon: "¶" },
-  { value: "email", label: "Email", icon: "@" },
-  { value: "number", label: "Number", icon: "#" },
-  { value: "single_select", label: "Dropdown", icon: "▾" },
-  { value: "multi_select", label: "Multi-select", icon: "☑" },
-  { value: "boolean", label: "Checkbox", icon: "✓" },
-  { value: "date", label: "Date", icon: "▦" },
-  { value: "file_upload", label: "File upload", icon: "↥" },
-  { value: "rating", label: "Rating", icon: "★" },
-];
 
 interface DraftField {
   field_key: string;
@@ -82,7 +80,7 @@ export function NewFormPage() {
   }
 
   function addField(type: FieldType) {
-    const label = FIELD_TYPES.find((f) => f.value === type)?.label ?? "Field";
+    const label = fieldMeta(type)?.defaultLabel ?? "Field";
     const field_key = uniqueKey(label);
     setFields([...fields, { field_key, field_type: type, label, is_required: false }]);
   }
@@ -131,7 +129,8 @@ export function NewFormPage() {
       if (formErr) throw formErr;
       if (!form) throw new Error("Form creation returned no row.");
 
-      // 2. Create the form fields (if any).
+      // 2. Create the form fields (if any) — with the registry's
+      // type-appropriate default config (selects get valid options).
       if (fields.length > 0) {
         const rows = fields.map((f, i) => ({
           form_id: form.id,
@@ -140,6 +139,7 @@ export function NewFormPage() {
           label: f.label,
           is_required: f.is_required,
           sort_order: i,
+          config: defaultConfigForType(f.field_type),
         }));
         const { error: fieldsErr } = await supabaseBrowser
           .from("form_fields")
@@ -245,7 +245,7 @@ export function NewFormPage() {
                     onChange={(e) => updateField(i, { field_type: e.target.value as FieldType })}
                     disabled={saving}
                   >
-                    {FIELD_TYPES.map((t) => (
+                    {FIELD_TYPE_REGISTRY.map((t) => (
                       <option key={t.value} value={t.value}>
                         {t.label}
                       </option>
@@ -277,7 +277,7 @@ export function NewFormPage() {
 
           {/* Add field buttons */}
           <div className="flex flex-wrap gap-2">
-            {FIELD_TYPES.map((t) => (
+            {FIELD_TYPE_REGISTRY.map((t) => (
               <button
                 key={t.value}
                 type="button"

@@ -3,8 +3,18 @@
  */
 export {};
 
-const URL = "https://sqtolkfjnskyxnltuyci.supabase.co";
-const KEY = "REDACTED_SUPABASE_SECRET_KEY";
+import process from "node:process";
+
+// Credentials come from the environment (.env.local — auto-loaded by bun).
+// Never hardcode keys in committed files.
+const URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+if (!URL || !KEY) {
+  console.error(
+    "Missing env: set NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.local (bun loads it automatically).",
+  );
+  process.exit(1);
+}
 
 const paths = [
   "/pg",

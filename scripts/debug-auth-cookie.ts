@@ -4,8 +4,16 @@
  */
 import { createServerClient } from "@supabase/ssr";
 
-const SUPABASE_URL = "https://sqtolkfjnskyxnltuyci.supabase.co";
-const SUPABASE_ANON_KEY = "sb_publishable_PbqLlhGOI_T13rtIFuEnFQ_Z2Fs9RZ6";
+// Credentials come from the environment (.env.local — auto-loaded by bun).
+// Never hardcode keys in committed files.
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
+  console.error(
+    "Missing env: set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in .env.local (bun loads it automatically).",
+  );
+  process.exit(1);
+}
 
 // 1. Get real tokens via password grant
 const authResp = await fetch(

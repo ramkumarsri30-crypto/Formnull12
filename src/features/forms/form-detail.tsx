@@ -69,8 +69,9 @@ import {
   ChevronDown as ChevronIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { FIELD_TYPES_BY_GROUP, fieldLabel } from "./field-types";
+import { FIELD_TYPES_BY_GROUP, fieldLabel, defaultConfigForType } from "./field-types";
 import { FieldEditor } from "./field-editor";
+import { useAuth } from "@/features/auth/auth-provider";
 
 type FormRow = Database["public"]["Tables"]["forms"]["Row"];
 type FormField = Database["public"]["Tables"]["form_fields"]["Row"];
@@ -104,6 +105,7 @@ function uniqueKey(label: string, existing: string[]): string {
 
 export function FormDetail({ formId }: { formId: string }) {
   const router = useRouter();
+  const { user } = useAuth();
   const [form, setForm] = useState<FormRow | null>(null);
   const [fields, setFields] = useState<FormField[]>([]);
   const [loading, setLoading] = useState(true);
@@ -170,13 +172,20 @@ export function FormDetail({ formId }: { formId: string }) {
       toast.error("Form name cannot be empty.");
       return;
     }
+    // updated_by must be the AUTHENTICATED current user — never a
+    // fabricated or inherited id (previously this wrote created_by,
+    // which misattributes edits when a workspace admin saves the form).
+    if (!user) {
+      toast.error("Your session has expired. Please sign in again.");
+      return;
+    }
     setSavingForm(true);
     const { error } = await supabaseBrowser
       .from("forms")
       .update({
         name: name.trim(),
         description: description.trim() || null,
-        updated_by: form.created_by,
+        updated_by: user.id,
       })
       .eq("id", form.id);
     setSavingForm(false);
@@ -185,7 +194,12 @@ export function FormDetail({ formId }: { formId: string }) {
       return;
     }
     toast.success("Form updated.");
-    setForm({ ...form, name: name.trim(), description: description.trim() || null });
+    setForm({
+      ...form,
+      name: name.trim(),
+      description: description.trim() || null,
+      updated_by: user.id,
+    });
   }
 
   async function deleteForm() {
@@ -216,13 +230,9 @@ export function FormDetail({ formId }: { formId: string }) {
       const key = uniqueKey(meta.label, existingKeys);
       const nextOrder = fields.length > 0 ? Math.max(...fields.map((f) => f.sort_order)) + 1 : 0;
 
-      // Type-appropriate default config.
-      const defaultConfig: Record<string, unknown> =
-        type === "single_select" || type === "multi_select"
-          ? { options: ["Option 1", "Option 2"] }
-          : type === "rating"
-            ? { max: 5 }
-            : {};
+      // Type-appropriate default config from the CENTRALIZED registry
+      // (selects start with valid options, ratings with max=5).
+      const defaultConfig = defaultConfigForType(type);
 
       const { data, error } = await supabaseBrowser
         .from("form_fields")
@@ -329,16 +339,41 @@ export function FormDetail({ formId }: { formId: string }) {
     if (updates.length === 0) return;
 
     try {
-      for (const u of updates) {
-        const { error } = await supabaseBrowser
-          .from("form_fields")
-          .update({ sort_order: u.sort_order })
-          .eq("id", u.id);
-        if (error) throw error;
-      }
+      // Fire the (typically 1–3) row updates as ONE parallel batch —
+      // every row is disjoint, so ordering between them is irrelevant.
+      // Previously these were sequential awaits: N network round-trips.
+      // NOTE: this is still N separate UPDATE statements, not one
+      // transaction — a mid-batch failure can leave a partial order in
+      // the DB. True atomicity would require a reorder RPC (new function
+      // via a future migration); that is intentionally NOT invented here.
+      // Instead, on failure we best-effort restore the previous order.
+      const results = await Promise.all(
+        updates.map((u) =>
+          supabaseBrowser
+            .from("form_fields")
+            .update({ sort_order: u.sort_order })
+            .eq("id", u.id),
+        ),
+      );
+      const failed = results.find((r) => r.error);
+      if (failed?.error) throw failed.error;
       toast.success("Field order saved.");
     } catch (e) {
-      // Persistence failed — restore the last database-confirmed order.
+      // Best-effort rollback: write the previous sort_orders back so the
+      // database matches the restored UI below. Rollback errors are
+      // logged but never mask the original failure.
+      try {
+        await Promise.all(
+          previousFields.map((p) =>
+            supabaseBrowser
+              .from("form_fields")
+              .update({ sort_order: p.sort_order })
+              .eq("id", p.id),
+          ),
+        );
+      } catch (rollbackErr) {
+        console.warn("[builder] order rollback failed:", rollbackErr);
+      }
       setFields(previousFields);
       setReorderError(
         "Could not save the new order. Reverted to the last saved order.",

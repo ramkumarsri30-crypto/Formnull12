@@ -334,3 +334,17 @@ Work Log:
 Stage Summary:
 - Code is push-ready and secret-clean; bundle fallback at download/formnull12-push.bundle
 - Remaining: actual `git push origin main` — blocked only on GitHub authorization (user can paste a fine-grained/classic PAT with repo Contents Read+Write for Formnull12, or run: git pull formnull12-push.bundle main && git push origin main from their own clone)
+---
+Task ID: 13
+Agent: Main agent (Super Z)
+Task: GitHub push attempt with user-provided fine-grained PAT
+
+Work Log:
+- User provided fine-grained PAT; used via one-time credential helper (token never persisted in git config, never committed, temp file deleted after each use)
+- Auth verified: GET /user → login ramkumarsri30-crypto (token valid)
+- git push origin main → 403 "Permission to Formnull12.git denied to ramkumarsri30-crypto"
+- Definitive diagnosis: POST /repos/.../git/refs (Contents-write) → 403 "Resource not accessible by personal access token" → token lacks Repository permission "Contents: Read and write" (fine-grained PAT default is No access; permissions cannot be edited after creation)
+- No side effects: temp branch test returned 403 (nothing created), token temp file removed
+
+Stage Summary:
+- Push still pending; user must generate NEW token with Contents: Read+write on Formnull12 (or classic PAT with repo scope); all 2 commits remain push-ready at c7f4432; bundle fallback intact

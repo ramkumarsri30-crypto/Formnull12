@@ -765,14 +765,36 @@ export function FieldControl({
       const step = typeof cfg.step === "number" && cfg.step > 0 ? cfg.step : 1;
       const leftLabel = typeof cfg.leftLabel === "string" ? cfg.leftLabel : null;
       const rightLabel = typeof cfg.rightLabel === "string" ? cfg.rightLabel : null;
-      const steps: number[] = [];
-      for (let v = min; v <= max + 1e-9; v += step) steps.push(Number(v.toFixed(6)));
       const current = typeof value === "number" ? value : undefined;
+
+      // Count steps BEFORE building any array: publish-side rules allow
+      // extreme-but-legal ranges (e.g. 0..1e9 step 1e-6), and iterating
+      // those out would freeze the tab. Beyond the cap the native range
+      // input renders the exact same answer shape with no loop — a
+      // presentation-only degradation, validation is unchanged.
+      const MAX_BUTTON_STEPS = 200;
+      const stepCount =
+        step > 0 && max > min ? Math.floor((max - min) / step + 1e-9) + 1 : 1;
 
       // Presentation style: config.style forces buttons or a slider;
       // unset ("Auto") picks buttons for short scales and a slider for
       // long ones. Same answer shape either way.
-      const style = cfg.style === "buttons" || cfg.style === "slider" ? cfg.style : steps.length > 12 ? "slider" : "buttons";
+      const style =
+        stepCount > MAX_BUTTON_STEPS
+          ? "slider"
+          : cfg.style === "buttons" || cfg.style === "slider"
+            ? cfg.style
+            : stepCount > 12
+              ? "slider"
+              : "buttons";
+
+      const steps: number[] = [];
+      if (style === "buttons") {
+        for (let v = min; v <= max + 1e-9; v += step) {
+          steps.push(Number(v.toFixed(6)));
+          if (steps.length > MAX_BUTTON_STEPS) break; // hard bound
+        }
+      }
 
       if (style === "buttons") {
         return (
@@ -1327,6 +1349,37 @@ export function FieldRenderer({
     );
   }
 
+  // Page break: a layout divider, never a data field. Always full width.
+  // In paged views it renders at the TOP of the page it starts; on the
+  // builder canvas it renders inline where it sits in the field order.
+  // The default "Page break" label would be noise for respondents, so
+  // it renders as a bare divider — any custom label shows as the new
+  // page's heading.
+  if (field.field_type === "page_break") {
+    const showLabel =
+      field.label.trim() !== "" && !/^page\s*break$/i.test(field.label.trim());
+    return (
+      <div className="form-field-cell py-3" style={{ "--field-w": 12 } as React.CSSProperties}>
+        <div className="flex items-center gap-3" aria-hidden>
+          <span className="h-px flex-1 bg-foreground/15" />
+          <span className="inline-block h-2.5 w-2.5 rotate-45 border-2 border-[color:var(--memphis-violet)]" />
+          <span className="h-px flex-1 bg-foreground/15" />
+        </div>
+        {showLabel && (
+          <p className="mt-2.5 text-center font-display text-base font-bold tracking-tight text-foreground">
+            {field.label}
+          </p>
+        )}
+        {field.description && (
+          <p className="mt-1 text-center text-sm text-muted-foreground">{field.description}</p>
+        )}
+        {field.help_text && (
+          <p className="mt-0.5 text-center text-xs text-muted-foreground/80">{field.help_text}</p>
+        )}
+      </div>
+    );
+  }
+
   const id = `${idPrefix}fld-${field.field_key}`;
 
   return (
@@ -1349,17 +1402,56 @@ export function FieldRenderer({
 }
 
 /* ------------------------------------------------------------------ */
+/* Page partitioning — standard mode with page breaks                  */
+/*                                                                      */
+/* A page break STARTS a new page and renders as that page's           */
+/* divider/header. A LEADING page break (nothing before it) stays on    */
+/* page one as its header; consecutive page breaks collapse (a page    */
+/* whose only content is dividers cannot be split further); a          */
+/* TRAILING page break (nothing after it) is dropped from respondent   */
+/* views — it would only render an empty final page. Forms without     */
+/* page breaks produce ONE page → the exact single-page presentation   */
+/* as before (no progress chrome, no Back/Next). The builder canvas    */
+/* is always the flat editing list — it never pages.                   */
+/* ------------------------------------------------------------------ */
+
+export function buildPages(sortedFields: RenderableFormField[]): RenderableFormField[][] {
+  const pages: RenderableFormField[][] = [[]];
+  for (const f of sortedFields) {
+    const current = pages[pages.length - 1];
+    if (
+      f.field_type === "page_break" &&
+      current.length > 0 &&
+      current.some((x) => x.field_type !== "page_break")
+    ) {
+      pages.push([f]);
+    } else {
+      current.push(f);
+    }
+  }
+  const last = pages[pages.length - 1];
+  if (last.length === 1 && last[0].field_type === "page_break") {
+    pages.pop();
+  }
+  if (pages.length === 0) pages.push([]);
+  return pages;
+}
+
+/* ------------------------------------------------------------------ */
 /* FormRenderer — the whole form                                       */
 /*                                                                      */
-/* Two PRESENTATION modes share this one renderer, the same field      */
+/* Three PRESENTATION modes share this one renderer, the same field    */
 /* definitions, the same validation and the same value model:          */
 /*                                                                      */
 /*   standard (default) — every field on a single scrolling page       */
-/*   card (settings.mode === "card") — one question at a time with     */
-/*                          Next/Back, a progress bar and per-step     */
-/*                          validation. Only the chrome differs; the   */
-/*                          FieldControl, FieldLabelBlock and          */
-/*                          validateFieldValue are identical.          */
+/*   paged (standard +  — page breaks split the form into Back/Next    */
+/*   page breaks)         pages with a progress bar; per-page          */
+/*                         validation on advance                       */
+/*   card (settings.mode — one question at a time with Next/Back,      */
+/*   === "card")          a progress bar and per-step validation.      */
+/*                                                                      */
+/* Only the chrome differs; the FieldControl, FieldLabelBlock and      */
+/* validateFieldValue are identical everywhere.                        */
 /* ------------------------------------------------------------------ */
 
 export function FormRenderer({
@@ -1372,6 +1464,7 @@ export function FormRenderer({
   className,
   children,
   idPrefix = "",
+  serverErrors,
 }: {
   form: RenderableFormHeader;
   fields: RenderableFormField[];
@@ -1385,6 +1478,15 @@ export function FormRenderer({
   children?: ReactNode;
   /** Prepended to every input id — keeps DOM ids unique per context. */
   idPrefix?: string;
+  /**
+   * Server-side validation results from submit_public_form's
+   * structured failure path (HTTP 200 + ok:false, per-field messages —
+   * 006/007's documented contract: "the client renders the per-field
+   * messages"). Rendered through the exact same per-field error chrome
+   * as client validation so respondents see ONE validation vocabulary.
+   * Re-submitting replaces them; editing a field re-validates it.
+   */
+  serverErrors?: Record<string, string>;
 }) {
   const [values, setValues] = useState<Record<string, unknown>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -1396,9 +1498,43 @@ export function FormRenderer({
   /** 0 = welcome card, 1..N = field cards (sorted order). */
   const [step, setStep] = useState(0);
 
+  // Surface server-rejected answers (submit_public_form's structured
+  // ok:false per-field messages) exactly like client-side errors; in
+  // card mode also jump back to the first failing question; in paged
+  // standard mode also jump to the page holding it. Uses the
+  // documented "adjust state when a prop changes" render pattern — the
+  // same approach FieldPropertyEditor uses for field switches — so no
+  // effect is needed and no extra render is committed.
+  const [appliedServerErrors, setAppliedServerErrors] = useState<
+    Record<string, string> | null
+  >(null);
+
   const sorted = useMemo(() => [...fields].sort((a, b) => a.sort_order - b.sort_order), [fields]);
   const total = sorted.length;
   const currentField = step >= 1 && step <= total ? sorted[step - 1] : null;
+
+  // Paged standard presentation: page breaks split respondent views
+  // into Back/Next pages (builder canvas stays the flat editing list;
+  // card mode already steps per field — a page break renders as a
+  // divider step there). Zero page breaks → ONE page → the exact
+  // single-page presentation as before.
+  const pages = useMemo(() => buildPages(sorted), [sorted]);
+  const isPaged = mode !== "builder" && !isCard && pages.length > 1;
+  const [page, setPage] = useState(0);
+
+  if (serverErrors && serverErrors !== appliedServerErrors) {
+    setAppliedServerErrors(serverErrors);
+    setErrors(serverErrors);
+    setShowErrors(true);
+    const firstKey = Object.keys(serverErrors)[0];
+    if (isCard) {
+      const idx = fields.findIndex((f) => f.field_key === firstKey);
+      if (idx >= 0) setStep(idx + 1);
+    } else if (isPaged) {
+      const pIdx = pages.findIndex((p) => p.some((f) => f.field_key === firstKey));
+      if (pIdx >= 0) setPage(pIdx);
+    }
+  }
 
   const submitLabel =
     typeof form.settings?.submit_button_label === "string" && form.settings.submit_button_label.trim()
@@ -1449,6 +1585,28 @@ export function FormRenderer({
         return;
       }
       // step === total → fall through to the real submit below.
+    }
+
+    // Paged standard mode: advance one page at a time, validating only
+    // the fields on the page being left (layout dividers on the page
+    // validate as null — they collect nothing). The final page runs the
+    // full submit below.
+    if (isPaged && page < pages.length - 1) {
+      const errs: Record<string, string> = {};
+      for (const f of pages[page]) {
+        const err = validateFieldValue(f, values[f.field_key]);
+        if (err) errs[f.field_key] = err;
+      }
+      setShowErrors(true);
+      setErrors(errs);
+      const errorKeys = Object.keys(errs);
+      if (errorKeys.length > 0) {
+        const el = document.getElementById(`${idPrefix}fld-${errorKeys[0]}`);
+        el?.focus?.();
+        return;
+      }
+      setPage(page + 1);
+      return;
     }
 
     const errs = validateAllValues(fields, values);
@@ -1562,7 +1720,7 @@ export function FormRenderer({
                   ? "Submitting…"
                   : onLast
                     ? submitLabel
-                    : currentField?.field_type === "section"
+                    : currentField?.field_type === "section" || currentField?.field_type === "page_break"
                       ? "Continue"
                       : "Next"}
               </Button>
@@ -1577,6 +1735,92 @@ export function FormRenderer({
                 {errorCount} answer{errorCount === 1 ? "" : "s"} need{errorCount === 1 ? "s" : ""} attention.
               </p>
             )}
+          </div>
+        )}
+      </form>
+    );
+  }
+
+  /* ---------------- Paged standard presentation ---------------- */
+  if (isPaged) {
+    const safePage = Math.min(page, pages.length - 1);
+    const pageFields = pages[safePage];
+    const onLastPage = safePage >= pages.length - 1;
+    const pct = Math.round(((safePage + 1) / pages.length) * 100);
+    return (
+      <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
+        {/* Form header — what respondents see */}
+        <header className="mb-6">
+          <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
+            {form.name}
+          </h2>
+          {form.description && (
+            <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{form.description}</p>
+          )}
+        </header>
+
+        {/* Page progress */}
+        <div className="mb-6">
+          <div className="mb-1.5 flex items-center justify-between text-xs text-muted-foreground">
+            <span aria-live="polite">
+              Page {safePage + 1} of {pages.length}
+            </span>
+            {onLastPage && <span>Final page</span>}
+          </div>
+          <div
+            role="progressbar"
+            aria-valuemin={1}
+            aria-valuemax={pages.length}
+            aria-valuenow={safePage + 1}
+            aria-label={`Page ${safePage + 1} of ${pages.length}`}
+            className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10"
+          >
+            <div
+              className="h-full rounded-full bg-[color:var(--memphis-coral)] transition-all duration-300"
+              style={{ width: `${pct}%` }}
+            />
+          </div>
+        </div>
+
+        {/* This page's fields (a page break leads its own page) */}
+        <div className="grid grid-cols-1 gap-x-4 gap-y-5 sm:grid-cols-12">
+          {pageFields.map((field) => (
+            <FieldRenderer
+              key={field.field_key}
+              field={field}
+              value={values[field.field_key]}
+              error={showErrors ? errors[field.field_key] : undefined}
+              onChange={(v) => setValue(field.field_key, v)}
+              mode={mode}
+              idPrefix={idPrefix}
+            />
+          ))}
+        </div>
+
+        {children}
+
+        {onSubmit && (
+          <div className="mt-8 space-y-3">
+            {showErrors && errorCount > 0 && (
+              <p className="text-sm font-medium text-destructive" role="alert">
+                {errorCount} answer{errorCount === 1 ? "" : "s"} need{errorCount === 1 ? "s" : ""} attention.
+              </p>
+            )}
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                type="button"
+                variant="outline"
+                size="lg"
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={submitting || safePage === 0}
+              >
+                Back
+              </Button>
+              <Button type="submit" variant="memphis-coral" size="lg" disabled={submitting}>
+                {submitting ? "Submitting…" : onLastPage ? submitLabel : "Next"}
+              </Button>
+            </div>
+            {submitNotice}
           </div>
         )}
       </form>

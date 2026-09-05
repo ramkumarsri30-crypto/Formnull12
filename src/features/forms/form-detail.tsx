@@ -127,7 +127,7 @@ import {
 } from "./field-registry";
 import { FieldPropertyEditor, type FieldDraft } from "./field-property-editor";
 import { FieldLibrary } from "./field-library";
-import { FieldLabelBlock, FieldControl, toRenderableField } from "./form-renderer";
+import { FieldLabelBlock, FieldControl, toRenderableField, type RenderableFormHeader } from "./form-renderer";
 import { PreviewDialog } from "./preview-dialog";
 import { PublishDialog, ShareDialog } from "./publish-dialog";
 import { useAuth } from "@/features/auth/auth-provider";
@@ -179,6 +179,27 @@ function statusColor(status: string): string {
 }
 
 const PIN_PREF_KEY = "formnull.builder.libraryPinned";
+
+/**
+ * Draft-aware preview header settings — mirrors saveForm()'s conventions
+ * (submit label + card mode stored only when set) so the preview shows
+ * the builder's CURRENT state, unsaved edits included. Without this the
+ * preview would silently show the last-saved header while the canvas
+ * respondent-view mixes saved and draft values.
+ */
+function previewSettingsFor(
+  saved: Record<string, unknown> | null | undefined,
+  draftSubmitLabel: string,
+  draftMode: "standard" | "card",
+): Record<string, unknown> {
+  const s: Record<string, unknown> = { ...(saved ?? {}) };
+  const t = draftSubmitLabel.trim().slice(0, 40);
+  if (t) s.submit_button_label = t;
+  else delete s.submit_button_label;
+  if (draftMode === "card") s.mode = "card";
+  else delete s.mode;
+  return s;
+}
 
 /** Quick-start library entries offered in the empty canvas. */
 const QUICK_START_ENTRIES: LibraryEntry[] = LIBRARY_ENTRIES.filter((e) =>
@@ -715,6 +736,16 @@ export function FormDetail({ formId }: { formId: string }) {
     savingForm || deletingForm || addingField !== null || deleteFieldBusy;
   const libraryDisabled = addingField !== null || deletingForm || savingForm;
 
+  // Draft form header for the preview — built from the CURRENT editor
+  // state (name, description, submit label, mode), never the stale
+  // saved row, so "exactly what respondents will see" is honest while
+  // there are unsaved edits.
+  const previewForm: RenderableFormHeader = {
+    name,
+    description: description || null,
+    settings: previewSettingsFor(form.settings, submitLabel, formMode),
+  };
+
   return (
     <div
       className="flex h-full min-h-0 flex-1 flex-col gap-3 p-3 sm:gap-4 sm:p-4 lg:p-5"
@@ -862,17 +893,17 @@ export function FormDetail({ formId }: { formId: string }) {
                   Respondent view
                 </p>
                 <h2 className="font-display text-2xl font-bold tracking-tight text-foreground">
-                  {form.name}
+                  {name}
                 </h2>
-                {form.description && (
+                {description && (
                   <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
-                    {form.description}
+                    {description}
                   </p>
                 )}
                 <p className="mt-2.5 text-xs text-muted-foreground/80">
                   {fields.length} field{fields.length === 1 ? "" : "s"}
                   {submitLabel.trim() ? ` · button “${submitLabel.trim()}”` : ""}
-                  {savedMode === "card" ? " · card mode" : ""}
+                  {formMode === "card" ? " · card mode" : ""}
                 </p>
               </div>
             </div>
@@ -1067,11 +1098,7 @@ export function FormDetail({ formId }: { formId: string }) {
       <PreviewDialog
         open={previewOpen}
         onOpenChange={setPreviewOpen}
-        form={{
-          name: form.name,
-          description: form.description,
-          settings: (form.settings ?? {}) as Record<string, unknown>,
-        }}
+        form={previewForm}
         fields={fields.map(toRenderableField)}
       />
 
@@ -1829,6 +1856,7 @@ function CanvasFieldCard({
   const def = fieldDef(field.field_type);
   const rf = toRenderableField(field);
   const isSection = field.field_type === "section";
+  const isLayout = isSection || field.field_type === "page_break";
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -1863,7 +1891,9 @@ function CanvasFieldCard({
           "group relative cursor-pointer rounded-2xl border-2 p-4 transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
           isSection
             ? "border-dashed border-foreground/25 bg-transparent hover:border-foreground/40"
-            : "border-foreground/10 bg-surface hover:border-foreground/30",
+            : isLayout
+              ? "border-dashed border-[color:var(--memphis-violet)]/40 bg-transparent hover:border-[color:var(--memphis-violet)]/70"
+              : "border-foreground/10 bg-surface hover:border-foreground/30",
           selected && "border-[color:var(--memphis-coral)] bg-surface shadow-[4px_4px_0_0_var(--memphis-ink)]",
           isDragging && "opacity-80 shadow-lg",
         )}
@@ -2004,6 +2034,37 @@ function FieldRendererForCanvas({
         )}
         {field.help_text && (
           <p className="mt-0.5 text-xs text-muted-foreground/80">{field.help_text}</p>
+        )}
+      </div>
+    );
+  }
+  if (field.field_type === "page_break") {
+    // Same divider the respondent views render (form-renderer.tsx),
+    // composed here directly so the canvas stays a flat editing list.
+    const showLabel =
+      field.label.trim() !== "" && !/^page\s*break$/i.test(field.label.trim());
+    return (
+      <div>
+        <div className="flex items-center gap-3" aria-hidden>
+          <span className="h-px flex-1 bg-foreground/15" />
+          <span className="inline-block h-2.5 w-2.5 rotate-45 border-2 border-[color:var(--memphis-violet)]" />
+          <span className="h-px flex-1 bg-foreground/15" />
+        </div>
+        {showLabel && (
+          <p className="mt-2.5 text-center font-display text-base font-bold tracking-tight text-foreground">
+            {field.label}
+          </p>
+        )}
+        {field.description && (
+          <p className="mt-1 text-center text-sm text-muted-foreground">{field.description}</p>
+        )}
+        {field.help_text && (
+          <p className="mt-0.5 text-center text-xs text-muted-foreground/80">{field.help_text}</p>
+        )}
+        {selected && (
+          <p className="mt-1.5 text-center text-[11px] font-medium text-[color:var(--memphis-violet)]">
+            Fields after this divider start a new page for respondents
+          </p>
         )}
       </div>
     );

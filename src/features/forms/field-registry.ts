@@ -74,6 +74,8 @@ import {
   MoveHorizontal,
   Table2,
   MapPin,
+  SeparatorHorizontal,
+  PenLine,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -153,7 +155,13 @@ export interface PropertyDefinition {
 /* ------------------------------------------------------------------ */
 
 /** Library grouping for ACTIVE types (the mental model of the rail). */
-export type FieldGroup = "text" | "contact" | "numbers" | "choice" | "datetime";
+export type FieldGroup =
+  | "text"
+  | "contact"
+  | "numbers"
+  | "choice"
+  | "datetime"
+  | "layout";
 
 export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
   { key: "text", label: "Text" },
@@ -161,6 +169,7 @@ export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
   { key: "numbers", label: "Numbers" },
   { key: "choice", label: "Choice" },
   { key: "datetime", label: "Date & time" },
+  { key: "layout", label: "Layout" },
 ];
 
 /**
@@ -933,13 +942,14 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       "Answers must land on a scale step — enforced on every public submission (server-side).",
   },
 
-  /* ── STAGED — implemented, waiting for migration 007 ──────────────
-   * These definitions are complete (properties, controls, validation,
-   * renderer). They are NOT offered in the field library and publish
-   * is blocked for them until 007 (which extends submit_public_form's
-   * submittable whitelist) is applied by the owner and verified. Flip
-   * status + submittable + publishable to activate after 007.
-   * Test rows can be inserted directly via the service key. */
+  /* ── ACTIVATED 2026-09-05 — migration 007 verified applied+probed ─
+   * datetime / matrix / address were staged while 007 awaited the
+   * owner. 007 is now applied on the live project (verified via a
+   * throwaway-form publish probe that hit 007's matrix config
+   * branch and was deleted afterwards), so the documented
+   * activation flip (status + submittable + publishable) is done
+   * and the types are live end-to-end: library, builder, publish,
+   * public form, server-validated submissions. */
 
   {
     value: "datetime",
@@ -947,11 +957,11 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     icon: CalendarClock,
     description: "A date together with a time of day.",
     group: "datetime",
-    status: "staged",
+    status: "active",
     answerType: "string",
     collectsData: true,
-    publishable: false,
-    submittable: false,
+    publishable: true,
+    submittable: true,
     defaultLabel: "Date & time",
     defaultConfig: () => ({}),
     properties: [
@@ -980,7 +990,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       },
     ],
     validationNote:
-      "Answers use the YYYY-MM-DD HH:MM local format. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+      "Answers use the YYYY-MM-DD HH:MM local format; impossible dates and optional min/max bounds are enforced on every public submission (server-side).",
   },
 
   {
@@ -989,11 +999,11 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     icon: Table2,
     description: "A grid of rows and columns — one choice per row.",
     group: "choice",
-    status: "staged",
+    status: "active",
     answerType: "record",
     collectsData: true,
-    publishable: false,
-    submittable: false,
+    publishable: true,
+    submittable: true,
     defaultLabel: "Matrix",
     defaultConfig: () => ({
       rows: ["Row 1", "Row 2"],
@@ -1029,7 +1039,7 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       },
     ],
     validationNote:
-      "Every row must map to one of the offered columns. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+      "Every row must map to one of the offered columns; row and column values are checked on every public submission (server-side).",
   },
 
   {
@@ -1038,11 +1048,11 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     icon: MapPin,
     description: "Street, city, postal code and country as one answer.",
     group: "contact",
-    status: "staged",
+    status: "active",
     answerType: "record",
     collectsData: true,
-    publishable: false,
-    submittable: false,
+    publishable: true,
+    submittable: true,
     defaultLabel: "Address",
     defaultConfig: () => ({
       showLine2: false,
@@ -1098,17 +1108,25 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       },
     ],
     validationNote:
-      "A required address needs street, city and country. Checked in the browser today; server-side enforcement arrives with migration 007 (not yet applied).",
+      "A required address needs street, city and country; part names, lengths and country codes are checked on every public submission (server-side).",
   },
 
-  /* ── LEGACY (existing forms only — full compatibility) ─────────── */
+  /* ── DEFERRED — real product blocks, kept for compatibility ──
+   * file_upload: 006's publish_form hard-blocks it (anonymous
+   *   storage policy does not exist yet); signature: 006/007's
+   *   c_submittable does not accept signature answers, so nothing
+   *   a respondent draws could be stored. Both stay out of the
+   *   library until their server contracts land (owner-applied
+   *   migrations). Existing rows keep rendering through these
+   *   defs — full compatibility. */
 
   {
     value: "section",
     label: "Section",
     icon: Heading2,
     description: "A heading + description that organizes your form. Collects no data.",
-    status: "legacy",
+    group: "layout",
+    status: "active",
     answerType: "none",
     collectsData: false,
     publishable: true,
@@ -1175,6 +1193,56 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     ],
     validationNote:
       "Publishing a form with this field is blocked until anonymous file storage exists (a later phase).",
+  },
+
+  /* ── page_break — REAL implementation (2026-09-05) ───────
+   * Layout type: respondent views split at each page break into
+   * pages with Back/Next navigation and a progress bar (standard
+   * mode); card mode shows it as a divider step. Collects no
+   * data; 006 counts it as a usable field for the publish census
+   * and submit simply never sends its key (submittable=false). */
+
+  {
+    value: "page_break",
+    label: "Page break",
+    icon: SeparatorHorizontal,
+    description:
+      "Splits the form into pages with Back/Next navigation. Collects no data.",
+    group: "layout",
+    status: "active",
+    answerType: "none",
+    collectsData: false,
+    publishable: true,
+    submittable: false,
+    defaultLabel: "Page break",
+    defaultConfig: () => ({}),
+    properties: [
+      P_LABEL,
+      {
+        ...P_DESCRIPTION,
+        hint: "Shown under the new page’s heading",
+      },
+      {
+        ...P_HELP,
+        hint: "Smaller note under the description",
+      },
+    ],
+  },
+
+  {
+    value: "signature",
+    label: "Signature",
+    icon: PenLine,
+    description:
+      "Drawn signature. Deferred — the submit contract cannot store drawings yet.",
+    status: "legacy",
+    answerType: "string",
+    collectsData: false,
+    publishable: true,
+    submittable: false,
+    defaultLabel: "Signature",
+    defaultConfig: () => ({}),
+    properties: [P_LABEL, P_DESCRIPTION, P_REQUIRED, P_WIDTH, P_HELP],
   },
 ];
 
@@ -1583,11 +1651,20 @@ export function validateConfig(
       if (!rows || !columns) {
         return { ok: false, message: "Matrix needs both rows and columns." };
       }
-      const rowCheck = validateOptions(rows.filter((r): r is string => typeof r === "string") as string[], labelMap(config.rowLabels));
+      // Same contract as single/multi_select (and 007's publish-side
+      // check): entries must be plain strings — never silently filtered,
+      // which would let a bad config pass here and fail at publish.
+      if (
+        rows.some((r) => typeof r !== "string") ||
+        columns.some((c) => typeof c !== "string")
+      ) {
+        return { ok: false, message: "Matrix rows and columns must be plain strings." };
+      }
+      const rowCheck = validateOptions(rows as string[], labelMap(config.rowLabels));
       if (!rowCheck.ok) {
         return { ok: false, message: rowCheck.message?.replace("option", "row").replace("Option", "Row") ?? "Invalid rows." };
       }
-      const colCheck = validateOptions(columns.filter((c): c is string => typeof c === "string") as string[], labelMap(config.columnLabels));
+      const colCheck = validateOptions(columns as string[], labelMap(config.columnLabels));
       if (!colCheck.ok) {
         return { ok: false, message: colCheck.message?.replace("option", "column").replace("Option", "Column") ?? "Invalid columns." };
       }

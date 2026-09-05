@@ -49,7 +49,6 @@ interface PublicFormState {
   fields: RenderableFormField[];
   reference: number | null;
 }
-
 /** Map submit_public_form's coded errors to respondent-friendly text. */
 function submitErrorText(rawMessage: string): { title: string; detail: string } {
   const code = rawMessage.split(":")[0]?.trim() ?? "";
@@ -68,6 +67,11 @@ function submitErrorText(rawMessage: string): { title: string; detail: string } 
       return {
         title: "Too many submissions",
         detail: "You have submitted several times in a short period — please wait a few minutes.",
+      };
+    case "SNAPSHOT_INVALID":
+      return {
+        title: "This form is unavailable",
+        detail: "The published form data is malformed. Contact the person who sent you this link.",
       };
     case "INVALID_PAYLOAD":
     case "PAYLOAD_TOO_LARGE":
@@ -104,6 +108,11 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
   });
   const [honeypot, setHoneypot] = useState("");
   const [submitError, setSubmitError] = useState<{ title: string; detail: string } | null>(null);
+  /** Per-field messages from submit_public_form's structured failure
+   *  path (HTTP 200 + ok:false — nothing was written). Threaded into
+   *  the FormRenderer so they render with the same per-field error
+   *  chrome as client-side validation, exactly as 006 documents. */
+  const [serverErrors, setServerErrors] = useState<Record<string, string> | null>(null);
 
   const load = useCallback(async () => {
     setState((s) => ({ ...s, phase: "loading" }));
@@ -182,7 +191,35 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
         setState((s) => ({ ...s, phase: "ready" }));
         return;
       }
-      const r = data as { ok?: boolean; reference?: number | null } | null;
+      const r = data as
+        | {
+            ok?: boolean;
+            reference?: number | null;
+            error_code?: string;
+            errors?: Record<string, string>;
+          }
+        | null;
+      // Structured validation failure (006/007): HTTP 200 with
+      // ok:false + per-field messages, and NOTHING was persisted.
+      // Showing the thank-you page here would be a silent data loss —
+      // render the server's messages on the form instead.
+      if (r && r.ok === false) {
+        const errs =
+          r.errors && typeof r.errors === "object" && !Array.isArray(r.errors)
+            ? r.errors
+            : {};
+        setServerErrors(errs);
+        setSubmitError({
+          title: "Some answers need attention",
+          detail:
+            Object.keys(errs).length > 0
+              ? "Please fix the highlighted answers and submit again."
+              : "The submitted answers did not pass validation. Please try again.",
+        });
+        setState((s) => ({ ...s, phase: "ready" }));
+        return;
+      }
+      setServerErrors(null);
       const reference = typeof r?.reference === "number" ? r.reference : null;
       setState((s) => ({ ...s, phase: "success", reference }));
     } catch (e) {
@@ -310,6 +347,7 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
                 mode="public"
                 onSubmit={onSubmit}
                 submitting={state.phase === "submitting"}
+                serverErrors={serverErrors ?? undefined}
               />
             </div>
           )}

@@ -561,6 +561,72 @@ function PropertyControlShell({
         </div>
       );
 
+    case "mime-list":
+      return (
+        <div className={cn(wrapperClass, "col-span-2")}>
+          <ControlLabel prop={prop} htmlFor={cid} />
+          <MimeListControl
+            value={draft.config[prop.key]}
+            onChange={(v) => onConfigValue(v)}
+            disabled={saving}
+            id={cid}
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "contact-parts":
+      return (
+        <div className={cn(wrapperClass, "col-span-2")}>
+          <ContactPartsControl
+            config={draft.config}
+            onConfigPatch={onConfigPatch}
+            disabled={saving}
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "weekdays":
+      return (
+        <div className={cn(wrapperClass, "col-span-2")}>
+          <p className="text-xs font-semibold text-foreground">{prop.label}</p>
+          <WeekdaysControl
+            value={draft.config[prop.key]}
+            onChange={(v) => onConfigValue(v)}
+            disabled={saving}
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "time-windows":
+      return (
+        <div className={cn(wrapperClass, "col-span-2")}>
+          <p className="text-xs font-semibold text-foreground">{prop.label}</p>
+          <TimeWindowsControl
+            value={draft.config[prop.key]}
+            onChange={(v) => onConfigValue(v)}
+            disabled={saving}
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
+    case "money":
+      return (
+        <div className={wrapperClass}>
+          <ControlLabel prop={prop} htmlFor={cid} />
+          <MoneyControl
+            value={draft.config[prop.key]}
+            onChange={(v) => onConfigValue(v)}
+            disabled={saving}
+            id={cid}
+          />
+          {prop.hint && <Hint text={prop.hint} />}
+        </div>
+      );
+
     default:
       return null;
   }
@@ -711,6 +777,343 @@ function DefaultCountryControl({
           ? "Uses the respondent's browser locale — no network lookup."
           : "Pre-selects this country's calling code on the public form."}
       </p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Field Expansion widgets                                              */
+/* ------------------------------------------------------------------ */
+
+/** Comma-separated MIME list ↔ config string[]. */
+function MimeListControl({
+  value,
+  onChange,
+  disabled,
+  id,
+}: {
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+  id: string;
+}) {
+  const raw = Array.isArray(value)
+    ? (value as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const [text, setText] = useState(raw.join(", "));
+  // Sync when the underlying config changes identity (field switch
+  // remounts the editor, this covers mid-session config resets).
+  const [synced, setSynced] = useState(false);
+  const display = synced ? raw.join(", ") : text;
+
+  return (
+    <div className="space-y-1.5">
+      <Input
+        id={id}
+        value={display}
+        onChange={(e) => {
+          setText(e.target.value);
+          setSynced(false);
+          const list = e.target.value
+            .split(",")
+            .map((t) => t.trim().toLowerCase())
+            .filter((t) => t !== "");
+          onChange(list.length > 0 ? list : null);
+        }}
+        disabled={disabled}
+        className="h-9 font-mono text-xs"
+        placeholder="image/png, application/pdf"
+        aria-describedby={`${id}-hint`}
+      />
+      <p id={`${id}-hint`} className="text-[11px] leading-snug text-muted-foreground">
+        {raw.length === 0
+          ? "Empty = the standard image + document set"
+          : `${raw.length} type${raw.length === 1 ? "" : "s"} allowed`}
+      </p>
+    </div>
+  );
+}
+
+/** Contact parts composite: enable + require + label + placeholder. */
+function ContactPartsControl({
+  config,
+  onConfigPatch,
+  disabled,
+}: {
+  config: Record<string, unknown>;
+  onConfigPatch: (p: Record<string, unknown>) => void;
+  disabled: boolean;
+}) {
+  const ALL = ["first_name", "last_name", "email", "phone"] as const;
+  const META: Record<string, string> = {
+    first_name: "First name",
+    last_name: "Last name",
+    email: "Email",
+    phone: "Phone",
+  };
+  const parts = Array.isArray(config.parts)
+    ? (config.parts as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const requiredParts = Array.isArray(config.requiredParts)
+    ? (config.requiredParts as unknown[]).filter((x): x is string => typeof x === "string")
+    : [];
+  const labels =
+    config.partLabels && typeof config.partLabels === "object" && !Array.isArray(config.partLabels)
+      ? (config.partLabels as Record<string, string>)
+      : {};
+
+  function togglePart(p: string, on: boolean) {
+    const next = on ? [...parts, p] : parts.filter((x) => x !== p);
+    const nextReq = requiredParts.filter((x) => next.includes(x));
+    onConfigPatch({ parts: next, requiredParts: nextReq });
+  }
+
+  function toggleRequired(p: string, on: boolean) {
+    const next = on ? [...requiredParts, p] : requiredParts.filter((x) => x !== p);
+    onConfigPatch({ requiredParts: next });
+  }
+
+  return (
+    <div className="space-y-1.5">
+      {ALL.map((p) => {
+        const enabled = parts.includes(p);
+        const req = requiredParts.includes(p);
+        return (
+          <div
+            key={p}
+            className={cn(
+              "rounded-xl border border-foreground/10 bg-background p-2.5",
+              !enabled && "opacity-60",
+            )}
+          >
+            <div className="flex items-center gap-3">
+              <label className="flex flex-1 cursor-pointer items-center gap-2 text-xs font-semibold text-foreground">
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) => togglePart(p, e.target.checked)}
+                  disabled={disabled}
+                  className="h-4 w-4 accent-[color:var(--memphis-coral)]"
+                />
+                {META[p]}
+              </label>
+              {enabled && (
+                <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={req}
+                    onChange={(e) => toggleRequired(p, e.target.checked)}
+                    disabled={disabled || p === "phone"}
+                    className="h-3.5 w-3.5 accent-[color:var(--memphis-coral)]"
+                    aria-label={`Require ${META[p]}`}
+                  />
+                  required
+                </label>
+              )}
+            </div>
+            {enabled && (
+              <Input
+                value={labels[p] ?? ""}
+                onChange={(e) => onConfigPatch({ partLabels: { ...labels, [p]: e.target.value } })}
+                disabled={disabled}
+                className="mt-2 h-8 text-xs"
+                placeholder={`Label (default “${META[p]}”)`}
+                maxLength={100}
+                aria-label={`${META[p]} label`}
+              />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function WeekdaysControl({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const days = Array.isArray(value)
+    ? (value as unknown[]).filter((x): x is number => typeof x === "number")
+    : [];
+  function toggle(d: number) {
+    const next = days.includes(d) ? days.filter((x) => x !== d) : [...days, d];
+    next.sort((a, b) => a - b);
+    onChange(next);
+  }
+  return (
+    <div className="flex gap-1" role="group" aria-label="Available days">
+      {DOW.map((label, d) => {
+        const on = days.includes(d);
+        return (
+          <button
+            key={label}
+            type="button"
+            onClick={() => toggle(d)}
+            disabled={disabled}
+            aria-pressed={on}
+            aria-label={`${label}day ${on ? "available" : "unavailable"}`}
+            className={cn(
+              "h-8 flex-1 rounded-lg border-2 text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+              on
+                ? "border-foreground bg-foreground text-background"
+                : "border-foreground/15 bg-background text-foreground/70 hover:border-foreground/40",
+            )}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TimeWindowsControl({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const windows = Array.isArray(value)
+    ? (value as unknown[]).filter(
+        (w): w is { start: string; end: string } =>
+          typeof w === "object" && w !== null &&
+          typeof (w as { start?: unknown }).start === "string" &&
+          typeof (w as { end?: unknown }).end === "string",
+      )
+    : [];
+
+  function update(next: { start: string; end: string }[]) {
+    onChange(next.length > 0 ? next : null);
+  }
+
+  function setAt(i: number, key: "start" | "end", v: string) {
+    const next = [...windows];
+    next[i] = { ...next[i], [key]: v };
+    update(next);
+  }
+
+  return (
+    <div className="space-y-1.5">
+      {windows.map((w, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <Input
+            type="time"
+            value={w.start}
+            onChange={(e) => setAt(i, "start", e.target.value)}
+            disabled={disabled}
+            className="h-8 flex-1 text-xs"
+            aria-label={`Window ${i + 1} start`}
+          />
+          <span className="text-xs text-muted-foreground" aria-hidden>→</span>
+          <Input
+            type="time"
+            value={w.end}
+            onChange={(e) => setAt(i, "end", e.target.value)}
+            disabled={disabled}
+            className="h-8 flex-1 text-xs"
+            aria-label={`Window ${i + 1} end`}
+          />
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            onClick={() => update(windows.filter((_, idx) => idx !== i))}
+            disabled={disabled}
+            aria-label={`Remove window ${i + 1}`}
+            className="shrink-0 text-muted-foreground hover:text-destructive"
+          >
+            <XIcon />
+          </Button>
+        </div>
+      ))}
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        className="w-full border-dashed"
+        onClick={() => update([...windows, { start: "09:00", end: "17:00" }])}
+        disabled={disabled || windows.length >= 5}
+        aria-label="Add a daily window"
+      >
+        <PlusIcon />
+        Add window
+      </Button>
+    </div>
+  );
+}
+
+function XIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-3.5 w-3.5" aria-hidden>
+      <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-3.5 w-3.5" aria-hidden>
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+/** Cents ↔ human money format ("12.50" ↔ 1250). */
+function MoneyControl({
+  value,
+  onChange,
+  disabled,
+  id,
+}: {
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+  id: string;
+}) {
+  const cents = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : null;
+  const [text, setText] = useState(
+    cents !== null ? (cents / 100).toFixed(2) : "",
+  );
+  const display = cents === null ? "" : text;
+
+  function commit(v: string) {
+    setText(v);
+    const n = Number(v.replace(",", "."));
+    if (v.trim() !== "" && Number.isFinite(n)) onChange(Math.round(n * 100));
+    else onChange(null);
+  }
+
+  return (
+    <div className="relative">
+      <Input
+        id={id}
+        type="text"
+        inputMode="decimal"
+        value={display}
+        onChange={(e) => commit(e.target.value)}
+        disabled={disabled}
+        className="h-9 pr-10 font-display text-base font-bold tabular-nums"
+        placeholder="0.00"
+        aria-describedby={`${id}-cur`}
+      />
+      <span
+        id={`${id}-cur`}
+        className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground"
+        aria-hidden
+      >
+        major units
+      </span>
     </div>
   );
 }

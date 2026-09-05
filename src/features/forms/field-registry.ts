@@ -76,6 +76,10 @@ import {
   MapPin,
   SeparatorHorizontal,
   PenLine,
+  Contact,
+  CreditCard,
+  CalendarCheck,
+  Frame,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -118,7 +122,12 @@ export type PropertyControl =
   | "default-country"
   | "date"
   | "datetime"
-  | "config-switch";
+  | "config-switch"
+  | "mime-list"
+  | "contact-parts"
+  | "weekdays"
+  | "time-windows"
+  | "money";
 
 export interface PropertyDefinition {
   /** config key (target=config) or column name (target=column). */
@@ -161,7 +170,9 @@ export type FieldGroup =
   | "numbers"
   | "choice"
   | "datetime"
-  | "layout";
+  | "layout"
+  | "files"
+  | "advanced";
 
 export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
   { key: "text", label: "Text" },
@@ -170,6 +181,8 @@ export const FIELD_GROUPS: { key: FieldGroup; label: string }[] = [
   { key: "choice", label: "Choice" },
   { key: "datetime", label: "Date & time" },
   { key: "layout", label: "Layout" },
+  { key: "files", label: "Files" },
+  { key: "advanced", label: "Advanced" },
 ];
 
 /**
@@ -214,6 +227,20 @@ export interface FieldTypeDef {
   /** submit_public_form (006) accepts answers for this type. Mirrors
    *  006's c_submittable — the public form only sends submittable keys. */
   submittable: boolean;
+  /**
+   * This def's full end-to-end contract (create + publish + submit)
+   * depends on migration 008, which the owner applies manually. The
+   * builder probes the live project at runtime (field-capabilities.ts)
+   * and hides these defs from the library / blocks publishing until
+   * the probe confirms 008 — honest in both states, zero code changes
+   * at activation time.
+   *   contact_info / payment / scheduler / embed: the field_type ENUM
+   *     value itself only exists after 008 (ALTER TYPE ADD VALUE).
+   *   file_upload / signature: enum value exists since 002, but 006's
+   *     publish_form hard-blocks file_upload and neither type's
+   *     answers are submittable until 008's RPC contract exists.
+   */
+  requiresV008?: boolean;
   defaultLabel: string;
   /** Config written on field creation (selects need valid options). */
   defaultConfig: () => Record<string, unknown>;
@@ -249,6 +276,71 @@ export const MAX_LENGTH_CFG = 10000;
 export const MAX_END_LABEL_LEN = 60;
 /** Cap for presentation-only config values (symbols, labels map). */
 export const MAX_PRESENTATION_LEN = 200;
+/* ── Field Expansion limits — mirror migration 008 exactly ────────── */
+/** 008 c_max_files — files per file_upload answer. */
+export const MAX_FILES_PER_FIELD = 10;
+/** 008 c_max_file_mb — per-file ceiling (also the bucket limit). */
+export const MAX_FILE_MB = 100;
+/** 008 c_max_mime_types — allowedTypes entries per field. */
+export const MAX_MIME_TYPES = 20;
+/** 008 c_min_amount_cents / c_max_amount_cents — payment bounds. */
+export const MIN_PAYMENT_CENTS = 50;
+export const MAX_PAYMENT_CENTS = 10_000_000;
+/** 008 c_max_windows — availability windows per scheduler field. */
+export const MAX_WINDOWS = 5;
+/** 008 c_slot_minutes bounds. */
+export const MIN_SLOT_MINUTES = 5;
+export const MAX_SLOT_MINUTES = 240;
+/** 008 c_max_booking_days bound. */
+export const MAX_BOOKING_DAYS = 365;
+/** Common IANA zones offered for scheduler configs (008 validates
+ *  against pg_timezone_names server-side; this is the curated UI set). */
+export const SCHEDULER_TIMEZONES: string[] = [
+  "UTC",
+  "America/New_York",
+  "America/Chicago",
+  "America/Denver",
+  "America/Los_Angeles",
+  "America/Sao_Paulo",
+  "Europe/London",
+  "Europe/Dublin",
+  "Europe/Paris",
+  "Europe/Berlin",
+  "Europe/Madrid",
+  "Europe/Rome",
+  "Europe/Amsterdam",
+  "Europe/Warsaw",
+  "Europe/Athens",
+  "Europe/Istanbul",
+  "Africa/Cairo",
+  "Africa/Lagos",
+  "Africa/Johannesburg",
+  "Asia/Dubai",
+  "Asia/Karachi",
+  "Asia/Kolkata",
+  "Asia/Dhaka",
+  "Asia/Bangkok",
+  "Asia/Singapore",
+  "Asia/Hong_Kong",
+  "Asia/Shanghai",
+  "Asia/Tokyo",
+  "Asia/Seoul",
+  "Australia/Perth",
+  "Australia/Sydney",
+  "Pacific/Auckland",
+];
+/** Stripe-capable currencies offered in the payment editor. */
+export const PAYMENT_CURRENCIES = [
+  { value: "USD", label: "USD — US Dollar" },
+  { value: "EUR", label: "EUR — Euro" },
+  { value: "GBP", label: "GBP — British Pound" },
+  { value: "INR", label: "INR — Indian Rupee" },
+  { value: "AUD", label: "AUD — Australian Dollar" },
+  { value: "CAD", label: "CAD — Canadian Dollar" },
+  { value: "JPY", label: "JPY — Japanese Yen" },
+  { value: "SGD", label: "SGD — Singapore Dollar" },
+  { value: "AED", label: "AED — UAE Dirham" },
+] as const;
 
 /* ------------------------------------------------------------------ */
 /* Reusable property fragments                                         */
@@ -1148,21 +1240,63 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
         hint: "Smaller note under the description",
         placeholder: "Optional",
       },
+      {
+        key: "alignment",
+        label: "Alignment",
+        section: "appearance",
+        target: "config",
+        control: "select",
+        enforcement: "presentation",
+        choices: [
+          { value: "left", label: "Left" },
+          { value: "center", label: "Center" },
+        ],
+        placeholder: "Left",
+        hint: "Heading and text alignment",
+      },
+      {
+        key: "showDivider",
+        label: "Divider",
+        section: "appearance",
+        target: "config",
+        control: "config-switch",
+        enforcement: "presentation",
+        defaultOn: false,
+        hint: "Draw a hairline rule under the section",
+      },
     ],
   },
+
+  /* ── FIELD EXPANSION — six capabilities gated on migration 008 ──
+   * file_upload / signature / contact_info / payment / scheduler /
+   * embed. The full server contracts (enum values, form_uploads +
+   * payments + bookings tables, create_upload_intent /
+   * create_payment_intent RPCs, publish + submit validation branches)
+   * ship in supabase/migrations/008_field_expansion.sql, applied by
+   * the owner like 005/006/007. The builder probes for 008 at runtime
+   * (field-capabilities.ts) and gates these defs honestly in both
+   * states. Nothing is faked: before 008 the types are absent from
+   * the library and publish stays blocked; after 008 everything is
+   * live end-to-end with zero code changes. */
 
   {
     value: "file_upload",
     label: "File upload",
     icon: Upload,
-    description: "File picker with type/size limits. Cannot be published yet.",
-    status: "legacy",
-    answerType: "string",
+    description: "Real uploads to secure storage with type and size limits.",
+    group: "files",
+    status: "active",
+    requiresV008: true,
+    answerType: "record",
     collectsData: true,
-    publishable: false,
-    submittable: false,
+    publishable: true,
+    submittable: true,
     defaultLabel: "File upload",
-    defaultConfig: () => ({}),
+    defaultConfig: () => ({
+      maxSizeMb: 10,
+      multiple: false,
+      maxFiles: 5,
+    }),
     properties: [
       P_LABEL,
       P_DESCRIPTION,
@@ -1170,29 +1304,52 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
       P_WIDTH,
       P_HELP,
       {
-        key: "allowedTypes",
-        label: "Allowed types",
-        section: "options",
+        key: "multiple",
+        label: "Allow multiple",
+        section: "behavior",
         target: "config",
-        control: "text",
-        enforcement: "presentation",
-        hint: "Comma-separated MIME types",
-        placeholder: "image/png, application/pdf",
+        control: "config-switch",
+        defaultOn: false,
+        hint: "Let respondents attach more than one file",
         fullWidth: true,
+      },
+      {
+        key: "maxFiles",
+        label: "Max files",
+        section: "validation",
+        target: "config",
+        control: "number",
+        enforcement: "server",
+        min: 1,
+        max: MAX_FILES_PER_FIELD,
+        step: 1,
+        hint: "Most files one answer may contain (when multiple is on)",
       },
       {
         key: "maxSizeMb",
         label: "Max size (MB)",
-        section: "options",
+        section: "validation",
         target: "config",
         control: "number",
-        enforcement: "presentation",
+        enforcement: "server",
         min: 1,
-        max: 100,
+        max: MAX_FILE_MB,
+        step: 1,
+        hint: "Per-file ceiling, checked before and after upload",
+      },
+      {
+        key: "allowedTypes",
+        label: "Allowed types",
+        section: "validation",
+        target: "config",
+        control: "mime-list",
+        enforcement: "server",
+        hint: "MIME types like image/png or application/pdf — empty allows the standard document and image set",
+        fullWidth: true,
       },
     ],
     validationNote:
-      "Publishing a form with this field is blocked until anonymous file storage exists (a later phase).",
+      "File size and type are validated server-side BEFORE the upload (intent RPC) and re-validated from storage at submission. Files are private; only workspace members can fetch them.",
   },
 
   /* ── page_break — REAL implementation (2026-09-05) ───────
@@ -1233,16 +1390,333 @@ export const FIELD_REGISTRY: FieldTypeDef[] = [
     value: "signature",
     label: "Signature",
     icon: PenLine,
-    description:
-      "Drawn signature. Deferred — the submit contract cannot store drawings yet.",
-    status: "legacy",
-    answerType: "string",
+    description: "Draw a signature with mouse, touch or pen.",
+    group: "files",
+    status: "active",
+    requiresV008: true,
+    answerType: "record",
+    collectsData: true,
+    publishable: true,
+    submittable: true,
+    defaultLabel: "Please sign here",
+    defaultConfig: () => ({}),
+    properties: [
+      P_LABEL,
+      {
+        ...P_DESCRIPTION,
+        hint: "Shown under the question",
+      },
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+    ],
+    validationNote:
+      "The drawing is stored as a compact PNG in private storage and attached to the submission; a required signature must be drawn. The reference upload runs only on the published form.",
+  },
+
+  /* ── Contact information — composite first/last/email/phone ── */
+  {
+    value: "contact_info",
+    label: "Contact information",
+    icon: Contact,
+    description: "First name, last name, email and phone as one structured answer.",
+    group: "contact",
+    status: "active",
+    requiresV008: true,
+    answerType: "record",
+    collectsData: true,
+    publishable: true,
+    submittable: true,
+    defaultLabel: "Contact information",
+    defaultConfig: () => ({
+      parts: ["first_name", "last_name", "email"],
+      requiredParts: ["first_name", "email"],
+    }),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+      {
+        key: "parts",
+        label: "Parts",
+        section: "content",
+        target: "config",
+        control: "contact-parts",
+        enforcement: "server",
+        hint: "Choose which parts appear and which are required",
+        fullWidth: true,
+      },
+    ],
+    validationNote:
+      "Part names, per-part formats (email / phone) and required parts are enforced on every public submission (server-side).",
+  },
+
+  /* ── Payment — Stripe architecture (requires env credentials) ── */
+  {
+    value: "payment",
+    label: "Payment",
+    icon: CreditCard,
+    description: "Collect a payment with the submission (Stripe).",
+    group: "advanced",
+    status: "active",
+    requiresV008: true,
+    answerType: "none",
+    collectsData: true,
+    publishable: true,
+    submittable: false,
+    defaultLabel: "Payment",
+    defaultConfig: () => ({
+      amountCents: 1000,
+      currency: "USD",
+      amountMode: "fixed",
+    }),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      {
+        key: "amountCents",
+        label: "Amount",
+        section: "general",
+        target: "config",
+        control: "money",
+        enforcement: "server",
+        min: MIN_PAYMENT_CENTS,
+        max: MAX_PAYMENT_CENTS,
+        hint: "What the respondent pays",
+        fullWidth: true,
+      },
+      {
+        key: "currency",
+        label: "Currency",
+        section: "general",
+        target: "config",
+        control: "select",
+        enforcement: "server",
+        choices: PAYMENT_CURRENCIES.map((c) => ({ value: c.value, label: c.label })),
+        placeholder: "USD",
+      },
+      {
+        key: "amountMode",
+        label: "Amount mode",
+        section: "behavior",
+        target: "config",
+        control: "select",
+        enforcement: "server",
+        choices: [
+          { value: "fixed", label: "Fixed price" },
+          { value: "minimum", label: "Minimum (respondent can pay more)" },
+        ],
+        placeholder: "Fixed price",
+        hint: "Minimum mode lets respondents choose a higher amount",
+      },
+      {
+        key: "paymentNote",
+        label: "Checkout line item",
+        section: "content",
+        target: "config",
+        control: "text",
+        enforcement: "presentation",
+        placeholder: "e.g. Registration fee",
+        hint: "Shown on the Stripe-hosted checkout page",
+        fullWidth: true,
+      },
+    ],
+    validationNote:
+      "Payments process through Stripe Checkout. A required payment must be SUCCEEDED before the submission is stored — the server verifies the payment record, never the browser. Requires STRIPE_SECRET_KEY configuration.",
+  },
+
+  /* ── Scheduler — internal booking engine ── */
+  {
+    value: "scheduler",
+    label: "Scheduler",
+    icon: CalendarCheck,
+    description: "Pick an available time slot from your availability rules.",
+    group: "advanced",
+    status: "active",
+    requiresV008: true,
+    answerType: "record",
+    collectsData: true,
+    publishable: true,
+    submittable: true,
+    defaultLabel: "When can we meet?",
+    defaultConfig: () => ({
+      days: [1, 2, 3, 4, 5],
+      windows: [{ start: "09:00", end: "17:00" }],
+      slotMinutes: 30,
+      bufferMinutes: 0,
+      minNoticeHours: 24,
+      maxBookingDays: 30,
+      timezone: "UTC",
+    }),
+    properties: [
+      P_LABEL,
+      P_DESCRIPTION,
+      P_REQUIRED,
+      P_WIDTH,
+      P_HELP,
+      {
+        key: "timezone",
+        label: "Timezone",
+        section: "general",
+        target: "config",
+        control: "select",
+        enforcement: "server",
+        choices: SCHEDULER_TIMEZONES.map((tz) => ({ value: tz, label: tz })),
+        placeholder: "UTC",
+        hint: "Availability windows are interpreted in this zone",
+      },
+      {
+        key: "days",
+        label: "Available days",
+        section: "behavior",
+        target: "config",
+        control: "weekdays",
+        enforcement: "server",
+        hint: "Which weekdays can be booked",
+        fullWidth: true,
+      },
+      {
+        key: "windows",
+        label: "Daily windows",
+        section: "behavior",
+        target: "config",
+        control: "time-windows",
+        enforcement: "server",
+        hint: "Times of day bookings may start",
+        fullWidth: true,
+      },
+      {
+        key: "slotMinutes",
+        label: "Slot length (min)",
+        section: "behavior",
+        target: "config",
+        control: "number",
+        enforcement: "server",
+        min: MIN_SLOT_MINUTES,
+        max: MAX_SLOT_MINUTES,
+        step: 5,
+        hint: "Duration of each bookable slot",
+      },
+      {
+        key: "bufferMinutes",
+        label: "Buffer (min)",
+        section: "behavior",
+        target: "config",
+        control: "number",
+        enforcement: "server",
+        min: 0,
+        max: 60,
+        step: 5,
+        hint: "Quiet time kept around every booking",
+      },
+      {
+        key: "minNoticeHours",
+        label: "Min notice (hours)",
+        section: "validation",
+        target: "config",
+        control: "number",
+        enforcement: "server",
+        min: 0,
+        max: 720,
+        step: 1,
+        hint: "How far ahead a slot must be to be bookable",
+      },
+      {
+        key: "maxBookingDays",
+        label: "Booking window (days)",
+        section: "validation",
+        target: "config",
+        control: "number",
+        enforcement: "server",
+        min: 1,
+        max: MAX_BOOKING_DAYS,
+        step: 1,
+        hint: "How many days ahead can be booked",
+      },
+    ],
+    validationNote:
+      "Slot alignment, availability windows, notice and booking-window rules, and double-booking are all enforced server-side on every submission.",
+  },
+
+  /* ── Embed — safe allowlisted video/link presentation block ── */
+  {
+    value: "embed",
+    label: "Embed",
+    icon: Frame,
+    description: "A video or link block inside the form. Collects no data.",
+    group: "layout",
+    status: "active",
+    requiresV008: true,
+    answerType: "none",
     collectsData: false,
     publishable: true,
     submittable: false,
-    defaultLabel: "Signature",
-    defaultConfig: () => ({}),
-    properties: [P_LABEL, P_DESCRIPTION, P_REQUIRED, P_WIDTH, P_HELP],
+    defaultLabel: "Embed",
+    defaultConfig: () => ({
+      embedType: "video",
+      aspectRatio: "16:9",
+    }),
+    properties: [
+      P_LABEL,
+      {
+        ...P_DESCRIPTION,
+        hint: "Shown above the embedded content",
+      },
+      {
+        key: "embedType",
+        label: "Type",
+        section: "content",
+        target: "config",
+        control: "select",
+        enforcement: "server",
+        choices: [
+          { value: "video", label: "Video (YouTube / Vimeo)" },
+          { value: "link", label: "Link card" },
+        ],
+        placeholder: "Video",
+      },
+      {
+        key: "url",
+        label: "URL",
+        section: "content",
+        target: "config",
+        control: "text",
+        enforcement: "server",
+        placeholder: "https://www.youtube.com/watch?v=…",
+        hint: "Video links embed a privacy-safe player; anything else renders as a link card",
+        fullWidth: true,
+      },
+      {
+        key: "aspectRatio",
+        label: "Aspect ratio",
+        section: "appearance",
+        target: "config",
+        control: "select",
+        enforcement: "presentation",
+        choices: [
+          { value: "16:9", label: "16 : 9" },
+          { value: "4:3", label: "4 : 3" },
+          { value: "1:1", label: "1 : 1" },
+        ],
+        placeholder: "16 : 9",
+      },
+      {
+        key: "linkText",
+        label: "Link text",
+        section: "appearance",
+        target: "config",
+        control: "text",
+        enforcement: "presentation",
+        placeholder: "Open link",
+        hint: "Label for link cards",
+      },
+    ],
+    validationNote:
+      "Only YouTube and Vimeo video URLs are embedded (sandboxed player, no arbitrary HTML). Other URLs render as safe link cards.",
   },
 ];
 
@@ -1399,6 +1873,59 @@ export const LIBRARY_BY_GROUP: Record<FieldGroup, LibraryEntry[]> =
     },
     {} as Record<FieldGroup, LibraryEntry[]>,
   );
+
+/* ------------------------------------------------------------------ */
+/* Migration-008 capability gating                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Effective publishability: defs carrying requiresV008 publish only
+ * once migration 008 is confirmed live (see field-capabilities.ts).
+ * The static `publishable` flag covers everything else (legacy
+ * compat defs stay non-publishable forever).
+ */
+export function defIsPublishable(
+  def: FieldTypeDef,
+  v008: boolean | null,
+): boolean {
+  if (def.requiresV008 && v008 !== true) return false;
+  return def.publishable;
+}
+
+/** Library entries visible for the current capability state. */
+export function libraryEntriesFor(v008: boolean | null): LibraryEntry[] {
+  return LIBRARY_ENTRIES.filter((e) => {
+    const def = fieldDefSafe(e.type);
+    return !(def?.requiresV008 && v008 !== true);
+  });
+}
+
+/** Grouped library entries visible for the current capability state. */
+export function libraryGroupsFor(
+  v008: boolean | null,
+): { key: FieldGroup; label: string; items: LibraryEntry[] }[] {
+  const entries = libraryEntriesFor(v008);
+  return FIELD_GROUPS.map((g) => ({
+    ...g,
+    items: entries.filter((e) => e.group === g.key),
+  })).filter((g) => g.items.length > 0);
+}
+
+/**
+ * Labels of non-publishable field TYPES present in a form, for the
+ * publish dialog's honest pre-flight block (capability-aware).
+ */
+export function blockedTypeLabelsFor(
+  fields: { field_type: FieldType }[],
+  v008: boolean | null,
+): string[] {
+  const labels = new Set<string>();
+  for (const f of fields) {
+    const def = fieldDefSafe(f.field_type);
+    if (def && !defIsPublishable(def, v008)) labels.add(def.label);
+  }
+  return [...labels];
+}
 
 /** Resolve a library entry back from a saved row's type + config
  *  (used by the builder to describe what a field "is" — e.g. an NPS
@@ -1727,25 +2254,251 @@ export function validateConfig(
       const maxSizeMb = config.maxSizeMb;
       if (
         maxSizeMb != null &&
-        (!Number.isFinite(Number(maxSizeMb)) ||
-          Number(maxSizeMb) <= 0 ||
-          Number(maxSizeMb) > 100)
+        (!intInRange(maxSizeMb, 1, MAX_FILE_MB))
       ) {
-        return { ok: false, message: "Max size must be between 0 and 100 MB." };
+        return { ok: false, message: `Max size must be a whole number between 1 and ${MAX_FILE_MB} MB.` };
+      }
+      const maxFiles = config.maxFiles;
+      if (maxFiles != null && !intInRange(maxFiles, 1, MAX_FILES_PER_FIELD)) {
+        return { ok: false, message: `Max files must be a whole number between 1 and ${MAX_FILES_PER_FIELD}.` };
+      }
+      if (config.multiple != null && typeof config.multiple !== "boolean") {
+        return { ok: false, message: "Allow multiple must be on or off." };
       }
       const allowedTypes = config.allowedTypes;
+      if (allowedTypes != null) {
+        if (!Array.isArray(allowedTypes)) {
+          return { ok: false, message: "Allowed types must be a list." };
+        }
+        if (allowedTypes.length > MAX_MIME_TYPES) {
+          return { ok: false, message: `At most ${MAX_MIME_TYPES} allowed types.` };
+        }
+        const MIME_RE = /^[a-z0-9!*+.-]+\/[a-z0-9!*+.-]+$/i;
+        for (const t of allowedTypes) {
+          if (typeof t !== "string" || !MIME_RE.test(t) || t.length > 100) {
+            return { ok: false, message: "Allowed types must look like image/png or application/pdf." };
+          }
+        }
+      }
+      return { ok: true };
+    }
+
+    case "contact_info": {
+      const parts = Array.isArray(config.parts) ? (config.parts as unknown[]) : [];
+      const PARTS = ["first_name", "last_name", "email", "phone"] as const;
+      if (parts.length === 0) {
+        return { ok: false, message: "Enable at least one contact part." };
+      }
+      if (parts.some((p) => typeof p !== "string" || !PARTS.includes(p as (typeof PARTS)[number]))) {
+        return { ok: false, message: "Contact parts must be first name, last name, email or phone." };
+      }
+      if (new Set(parts).size !== parts.length) {
+        return { ok: false, message: "Contact parts cannot repeat." };
+      }
+      const req = Array.isArray(config.requiredParts) ? (config.requiredParts as unknown[]) : [];
+      if (req.some((p) => typeof p !== "string" || !parts.includes(p))) {
+        return { ok: false, message: "Required parts must be enabled parts." };
+      }
+      for (const mapKey of ["partLabels", "partPlaceholders"] as const) {
+        const m = config[mapKey];
+        if (m == null) continue;
+        if (typeof m !== "object" || Array.isArray(m)) {
+          return { ok: false, message: "Contact part labels must be a simple map." };
+        }
+        for (const [k, v] of Object.entries(m as Record<string, unknown>)) {
+          if (typeof v !== "string") {
+            return { ok: false, message: "Contact part labels must be text." };
+          }
+          if (!parts.includes(k)) {
+            return { ok: false, message: "A contact label belongs to a part that is not enabled." };
+          }
+          if (v.length > 100) {
+            return { ok: false, message: "Contact part labels must be at most 100 characters." };
+          }
+        }
+      }
+      return { ok: true };
+    }
+
+    case "payment": {
+      const amountCents = config.amountCents;
+      if (!intInRange(amountCents, MIN_PAYMENT_CENTS, MAX_PAYMENT_CENTS)) {
+        return {
+          ok: false,
+          message: `Amount must be between $${(MIN_PAYMENT_CENTS / 100).toFixed(2)} and $${(MAX_PAYMENT_CENTS / 100).toFixed(0)}.`,
+        };
+      }
+      const currency = config.currency;
       if (
-        allowedTypes != null &&
-        (!Array.isArray(allowedTypes) ||
-          allowedTypes.some((t) => typeof t !== "string"))
+        typeof currency !== "string" ||
+        !PAYMENT_CURRENCIES.some((c) => c.value === currency)
       ) {
-        return { ok: false, message: "Allowed types must be a list of strings." };
+        return { ok: false, message: "Choose one of the supported currencies." };
+      }
+      if (
+        config.amountMode != null &&
+        !["fixed", "minimum"].includes(String(config.amountMode))
+      ) {
+        return { ok: false, message: "Amount mode must be fixed or minimum." };
+      }
+      if (
+        config.paymentNote != null &&
+        (typeof config.paymentNote !== "string" || config.paymentNote.length > 200)
+      ) {
+        return { ok: false, message: "Checkout line item must be at most 200 characters." };
+      }
+      return { ok: true };
+    }
+
+    case "scheduler": {
+      const days = Array.isArray(config.days) ? (config.days as unknown[]) : [];
+      if (days.length === 0) {
+        return { ok: false, message: "Pick at least one available day." };
+      }
+      if (
+        days.some((d) => !intInRange(d, 0, 6)) ||
+        new Set(days).size !== days.length
+      ) {
+        return { ok: false, message: "Available days must be unique weekdays (0–6)." };
+      }
+      const slotMinutes = config.slotMinutes;
+      if (!intInRange(slotMinutes, MIN_SLOT_MINUTES, MAX_SLOT_MINUTES)) {
+        return { ok: false, message: `Slot length must be ${MIN_SLOT_MINUTES}–${MAX_SLOT_MINUTES} minutes.` };
+      }
+      if (config.bufferMinutes != null && !intInRange(config.bufferMinutes, 0, 60)) {
+        return { ok: false, message: "Buffer must be 0–60 minutes." };
+      }
+      if (config.minNoticeHours != null && !intInRange(config.minNoticeHours, 0, 720)) {
+        return { ok: false, message: "Min notice must be 0–720 hours." };
+      }
+      if (config.maxBookingDays != null && !intInRange(config.maxBookingDays, 1, MAX_BOOKING_DAYS)) {
+        return { ok: false, message: "Booking window must be 1–365 days." };
+      }
+      const tz = config.timezone;
+      if (typeof tz !== "string" || tz.length === 0 || tz.length > 60) {
+        return { ok: false, message: "Choose a timezone." };
+      }
+      const windows = Array.isArray(config.windows) ? (config.windows as unknown[]) : [];
+      if (windows.length === 0) {
+        return { ok: false, message: "Add at least one daily window." };
+      }
+      if (windows.length > MAX_WINDOWS) {
+        return { ok: false, message: `At most ${MAX_WINDOWS} windows.` };
+      }
+      const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+      const ranges: [string, string][] = [];
+      for (const w of windows) {
+        if (typeof w !== "object" || w === null || Array.isArray(w)) {
+          return { ok: false, message: "Windows must be start/end pairs." };
+        }
+        const o = w as Record<string, unknown>;
+        const s = o.start, e = o.end;
+        if (typeof s !== "string" || typeof e !== "string" || !TIME_RE.test(s) || !TIME_RE.test(e)) {
+          return { ok: false, message: "Window times must be HH:MM (24-hour)." };
+        }
+        if (s >= e) {
+          return { ok: false, message: "A window's start must be before its end." };
+        }
+        ranges.push([s, e]);
+      }
+      ranges.sort();
+      for (let i = 1; i < ranges.length; i += 1) {
+        if (ranges[i][0] < ranges[i - 1][1]) {
+          return { ok: false, message: "Windows cannot overlap — merge them instead." };
+        }
+      }
+      return { ok: true };
+    }
+
+    case "embed": {
+      const embedType = config.embedType;
+      if (embedType != null && !["video", "link"].includes(String(embedType))) {
+        return { ok: false, message: "Embed type must be video or link." };
+      }
+      if (config.aspectRatio != null && !["16:9", "4:3", "1:1"].includes(String(config.aspectRatio))) {
+        return { ok: false, message: "Aspect ratio must be 16:9, 4:3 or 1:1." };
+      }
+      if (config.linkText != null && (typeof config.linkText !== "string" || config.linkText.length > 200)) {
+        return { ok: false, message: "Link text must be at most 200 characters." };
+      }
+      const url = config.url;
+      if (url == null) return { ok: true }; // an embed without a URL renders as a placeholder
+      if (typeof url !== "string" || url.length > 2048) {
+        return { ok: false, message: "URL must be at most 2048 characters." };
+      }
+      if (!/^https:\/\//.test(url)) {
+        return { ok: false, message: "Embed URLs must start with https://." };
+      }
+      if (String(embedType ?? "video") === "video" && !parseVideoEmbed(url)) {
+        return { ok: false, message: "Video embeds accept YouTube and Vimeo links only — other URLs render as link cards." };
       }
       return { ok: true };
     }
 
     default:
       return { ok: true };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Embed URL parsing — the allowlisted video providers                  */
+/* ------------------------------------------------------------------ */
+
+export interface ParsedVideoEmbed {
+  provider: "youtube" | "vimeo";
+  src: string;
+}
+
+/**
+ * Parse a URL into a SAFE embeddable video player URL. Returns null
+ * for everything that is not an exact YouTube/Vimeo video link.
+ * The output src is always one of:
+ *   https://www.youtube-nocookie.com/embed/{11-char id}
+ *   https://player.vimeo.com/video/{digits}
+ * No query strings, no fragments, no arbitrary hosts — the allowlist
+ * is the security boundary (mirrored server-side in migration 008).
+ */
+export function parseVideoEmbed(url: string): ParsedVideoEmbed | null {
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return null;
+    const host = u.hostname.toLowerCase();
+
+    // YouTube: youtube.com/watch?v=… | youtu.be/{id} | youtube.com/short/{id}
+    if (host === "youtube.com" || host === "www.youtube.com" || host === "m.youtube.com") {
+      let id: string | null = null;
+      if (u.pathname === "/watch") id = u.searchParams.get("v");
+      else if (u.pathname.startsWith("/shorts/")) id = u.pathname.slice(8);
+      else if (u.pathname.startsWith("/embed/")) id = u.pathname.slice(7);
+      if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) {
+        return { provider: "youtube", src: `https://www.youtube-nocookie.com/embed/${id}` };
+      }
+      return null;
+    }
+    if (host === "youtu.be") {
+      const id = u.pathname.slice(1);
+      if (id && /^[A-Za-z0-9_-]{11}$/.test(id)) {
+        return { provider: "youtube", src: `https://www.youtube-nocookie.com/embed/${id}` };
+      }
+      return null;
+    }
+    if (host === "vimeo.com" || host === "www.vimeo.com") {
+      const id = u.pathname.replace(/^\//, "");
+      if (/^\d{1,10}$/.test(id)) {
+        return { provider: "vimeo", src: `https://player.vimeo.com/video/${id}` };
+      }
+      return null;
+    }
+    if (host === "player.vimeo.com") {
+      const id = u.pathname.replace(/^\/video\//, "");
+      if (/^\d{1,10}$/.test(id)) {
+        return { provider: "vimeo", src: `https://player.vimeo.com/video/${id}` };
+      }
+      return null;
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 

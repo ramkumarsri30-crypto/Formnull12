@@ -15,39 +15,50 @@
  */
 import { useMemo, useState } from "react";
 import {
-  FIELD_GROUPS,
-  LIBRARY_BY_GROUP,
+  libraryGroupsFor,
   MAX_FIELDS_PER_FORM,
+  type FieldGroup,
   type LibraryEntry,
 } from "./field-registry";
 import { Search, Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 
+/**
+ * `groups` overrides the static group map with a capability-filtered
+ * one (libraryGroupsFor(v008)) so migration-008-gated types appear
+ * only once the owner has applied 008 — the probe lives in
+ * form-detail.tsx; this component stays presentational.
+ */
 export function FieldLibrary({
   onAdd,
   disabled,
   fieldCount,
+  groups: groupsProp,
 }: {
   onAdd: (entry: LibraryEntry) => void;
   disabled: boolean;
   fieldCount: number;
+  groups?: { key: FieldGroup; label: string; items: LibraryEntry[] }[];
 }) {
   const [query, setQuery] = useState("");
   const q = query.trim().toLowerCase();
 
   const groups = useMemo(() => {
-    if (!q) return FIELD_GROUPS.map((g) => ({ ...g, items: LIBRARY_BY_GROUP[g.key] }));
-    return FIELD_GROUPS.map((g) => ({
-      ...g,
-      items: LIBRARY_BY_GROUP[g.key].filter(
-        (t) =>
-          t.label.toLowerCase().includes(q) ||
-          t.description.toLowerCase().includes(q) ||
-          t.type.includes(q),
-      ),
-    })).filter((g) => g.items.length > 0);
-  }, [q]);
+    const base = groupsProp ?? libraryGroupsFor(null);
+    if (!q) return base;
+    return base
+      .map((g) => ({
+        ...g,
+        items: g.items.filter(
+          (t) =>
+            t.label.toLowerCase().includes(q) ||
+            t.description.toLowerCase().includes(q) ||
+            t.type.includes(q),
+        ),
+      }))
+      .filter((g) => g.items.length > 0);
+  }, [q, groupsProp]);
 
   const atLimit = fieldCount >= MAX_FIELDS_PER_FORM;
 

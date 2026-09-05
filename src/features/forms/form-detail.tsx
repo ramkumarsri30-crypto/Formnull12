@@ -88,6 +88,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Switch } from "@/components/ui/switch";
 import { GeometricCircle, GeometricTriangle } from "@/components/memphis/memphis-decorations";
 import { supabaseBrowser } from "@/lib/supabase/client";
 import type { Database } from "@/lib/supabase/types";
@@ -109,9 +110,6 @@ import {
   TriangleAlert,
   Check,
   Loader2,
-  PanelLeftClose,
-  PanelLeftOpen,
-  Search,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -120,11 +118,14 @@ import {
   libraryLabelFor,
   MAX_FIELDS_PER_FORM,
   FIELD_LIMIT_WARN_AT,
-  FIELD_GROUPS,
-  LIBRARY_BY_GROUP,
   LIBRARY_ENTRIES,
+  libraryGroupsFor,
+  blockedTypeLabelsFor,
+  type FieldGroup,
   type LibraryEntry,
 } from "./field-registry";
+import { detectFieldCapabilities } from "./field-capabilities";
+import { EmbedBlock } from "./form-renderer";
 import { FieldPropertyEditor, type FieldDraft } from "./field-property-editor";
 import { FieldLibrary } from "./field-library";
 import { FieldLabelBlock, FieldControl, toRenderableField, type RenderableFormHeader } from "./form-renderer";
@@ -178,19 +179,20 @@ function statusColor(status: string): string {
   }
 }
 
-const PIN_PREF_KEY = "formnull.builder.libraryPinned";
+const PIN_PREF_KEY = "formnull.builder.libraryPinned"; // retired — the library is now always expanded (owner directive)
 
 /**
  * Draft-aware preview header settings — mirrors saveForm()'s conventions
- * (submit label + card mode stored only when set) so the preview shows
- * the builder's CURRENT state, unsaved edits included. Without this the
- * preview would silently show the last-saved header while the canvas
- * respondent-view mixes saved and draft values.
+ * (submit label + card mode + screens stored only when set) so the
+ * preview shows the builder's CURRENT state, unsaved edits included.
+ * Without this the preview would silently show the last-saved header
+ * while the canvas respondent-view mixes saved and draft values.
  */
 function previewSettingsFor(
   saved: Record<string, unknown> | null | undefined,
   draftSubmitLabel: string,
   draftMode: "standard" | "card",
+  drafts: ScreenDrafts,
 ): Record<string, unknown> {
   const s: Record<string, unknown> = { ...(saved ?? {}) };
   const t = draftSubmitLabel.trim().slice(0, 40);
@@ -198,7 +200,65 @@ function previewSettingsFor(
   else delete s.submit_button_label;
   if (draftMode === "card") s.mode = "card";
   else delete s.mode;
+  if (drafts.welcomeOn) {
+    const w: Record<string, unknown> = { enabled: true };
+    if (drafts.welcomeTitle.trim()) w.title = drafts.welcomeTitle.trim().slice(0, 200);
+    if (drafts.welcomeDescription.trim()) w.description = drafts.welcomeDescription.trim().slice(0, 1000);
+    if (drafts.welcomeButton.trim()) w.button_label = drafts.welcomeButton.trim().slice(0, 40);
+    s.welcome = w;
+  } else delete s.welcome;
+  if (drafts.thankyouOn) {
+    const tk: Record<string, unknown> = { enabled: true };
+    if (drafts.thankyouTitle.trim()) tk.title = drafts.thankyouTitle.trim().slice(0, 200);
+    if (drafts.thankyouDescription.trim()) tk.description = drafts.thankyouDescription.trim().slice(0, 1000);
+    if (drafts.thankyouButton.trim()) tk.button_label = drafts.thankyouButton.trim().slice(0, 40);
+    if (/^https:\/\//.test(drafts.thankyouLink.trim())) tk.link_url = drafts.thankyouLink.trim().slice(0, 2048);
+    s.thankyou = tk;
+  } else delete s.thankyou;
   return s;
+}
+
+/** Screen drafts bundle (welcome + thank-you). */
+interface ScreenDraftSetters {
+  setWelcomeOn: (v: boolean) => void;
+  setWelcomeTitle: (v: string) => void;
+  setWelcomeDescription: (v: string) => void;
+  setWelcomeButton: (v: string) => void;
+  setThankyouOn: (v: boolean) => void;
+  setThankyouTitle: (v: string) => void;
+  setThankyouDescription: (v: string) => void;
+  setThankyouButton: (v: string) => void;
+  setThankyouLink: (v: string) => void;
+}
+
+/** Screen drafts bundle (welcome + thank-you). */
+interface ScreenDrafts {
+  welcomeOn: boolean;
+  welcomeTitle: string;
+  welcomeDescription: string;
+  welcomeButton: string;
+  thankyouOn: boolean;
+  thankyouTitle: string;
+  thankyouDescription: string;
+  thankyouButton: string;
+  thankyouLink: string;
+}
+
+/** Read saved screen settings as plain drafts for dirty comparison. */
+function readScreenDrafts(
+  settings: Record<string, unknown> | null | undefined,
+  which: "welcome" | "thankyou",
+): { enabled?: boolean; title?: string; description?: string; button?: string; link?: string } {
+  const o = settings?.[which];
+  if (!o || typeof o !== "object" || Array.isArray(o)) return {};
+  const r = o as Record<string, unknown>;
+  return {
+    enabled: r.enabled === true,
+    title: typeof r.title === "string" ? r.title : undefined,
+    description: typeof r.description === "string" ? r.description : undefined,
+    button: typeof r.button_label === "string" ? r.button_label : undefined,
+    link: typeof r.link_url === "string" ? r.link_url : undefined,
+  };
 }
 
 /** Quick-start library entries offered in the empty canvas. */
@@ -227,6 +287,19 @@ export function FormDetail({ formId }: { formId: string }) {
   /** Presentation mode — "card" shows one question at a time (preview +
    *  public). Stored in forms.settings, snapshotted by publish_form. */
   const [formMode, setFormMode] = useState<"standard" | "card">("standard");
+  /** Welcome / thank-you screen drafts (settings.welcome / .thankyou —
+   *  presentation-only, flow through the publish snapshot wholesale). */
+  const [welcomeOn, setWelcomeOn] = useState(false);
+  const [welcomeTitle, setWelcomeTitle] = useState("");
+  const [welcomeDescription, setWelcomeDescription] = useState("");
+  const [welcomeButton, setWelcomeButton] = useState("");
+  const [thankyouOn, setThankyouOn] = useState(false);
+  const [thankyouTitle, setThankyouTitle] = useState("");
+  const [thankyouDescription, setThankyouDescription] = useState("");
+  const [thankyouButton, setThankyouButton] = useState("");
+  const [thankyouLink, setThankyouLink] = useState("");
+  /** Migration-008 capability (new field types' server contract). */
+  const [v008, setV008] = useState<boolean | null>(null);
   const [savingForm, setSavingForm] = useState(false);
   const [deletingForm, setDeletingForm] = useState(false);
 
@@ -238,8 +311,8 @@ export function FormDetail({ formId }: { formId: string }) {
   const [duplicatingFieldId, setDuplicatingFieldId] = useState<string | null>(null);
   const [reorderError, setReorderError] = useState<string | null>(null);
 
-  // Library rail state
-  const [libraryPinned, setLibraryPinned] = useState(false);
+  // Library rail state — RETIRED per owner directive: the Add Fields
+  // pane is now ALWAYS expanded on desktop (no shrink/collapse mode).
 
   // Dialogs / sheets
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -254,55 +327,61 @@ export function FormDetail({ formId }: { formId: string }) {
   const [librarySheetOpen, setLibrarySheetOpen] = useState(false);
   const [propsSheetOpen, setPropsSheetOpen] = useState(false);
 
-  // Restore the user's deliberate pin preference (per browser).
+  // Clean up the retired pin preference (the library is always expanded
+  // now — the old collapse-to-rail mode was removed by owner directive).
   useEffect(() => {
     try {
-      setLibraryPinned(window.localStorage.getItem(PIN_PREF_KEY) === "1");
+      window.localStorage.removeItem(PIN_PREF_KEY);
     } catch {
-      /* storage unavailable — the rail simply defaults to collapsed */
+      /* storage unavailable — nothing to clean */
     }
   }, []);
 
-  function toggleLibraryPinned() {
-    setLibraryPinned((p) => {
-      const next = !p;
-      try {
-        window.localStorage.setItem(PIN_PREF_KEY, next ? "1" : "0");
-      } catch {
-        /* preference not persisted — still toggles for this session */
-      }
-      return next;
-    });
-  }
+  // Detect migration 008 (new field types' server contract) once per
+  // builder load; the library and publish gate adapt to the result.
+  useEffect(() => {
+    void detectFieldCapabilities().then((ok) => setV008(ok));
+  }, []);
 
   const fieldIds = useMemo(() => fields.map((f) => f.id), [fields]);
   const selectedField = useMemo(
     () => fields.find((f) => f.id === selectedFieldId) ?? null,
     [fields, selectedFieldId],
   );
+  // Capability-gated library groups (migration 008 types appear only
+  // after the owner applies it — honest both before and after).
+  const gatedLibraryGroups = useMemo(() => libraryGroupsFor(v008), [v008]);
   const savedSubmitLabel =
     typeof form?.settings?.submit_button_label === "string"
       ? (form.settings.submit_button_label as string)
       : "";
   const savedMode: "standard" | "card" =
     form?.settings?.mode === "card" ? "card" : "standard";
+  const savedWelcome = readScreenDrafts(form?.settings, "welcome");
+  const savedThankyou = readScreenDrafts(form?.settings, "thankyou");
   const formDetailsDirty =
     form !== null &&
     (name !== form.name ||
       (description || "") !== (form.description ?? "") ||
       submitLabel !== savedSubmitLabel ||
-      formMode !== savedMode);
+      formMode !== savedMode ||
+      welcomeOn !== (savedWelcome.enabled === true) ||
+      welcomeTitle !== (savedWelcome.title ?? "") ||
+      welcomeDescription !== (savedWelcome.description ?? "") ||
+      welcomeButton !== (savedWelcome.button ?? "") ||
+      thankyouOn !== (savedThankyou.enabled === true) ||
+      thankyouTitle !== (savedThankyou.title ?? "") ||
+      thankyouDescription !== (savedThankyou.description ?? "") ||
+      thankyouButton !== (savedThankyou.button ?? "") ||
+      thankyouLink !== (savedThankyou.link ?? ""));
   const hasFileUpload = fields.some((f) => f.field_type === "file_upload");
-  /** Field types present in this form that cannot be published yet
-   *  (file upload + staged types waiting for migration 007). */
-  const blockedTypes = useMemo(() => {
-    const labels = new Set<string>();
-    for (const f of fields) {
-      const def = fieldDefSafe(f.field_type);
-      if (def && !def.publishable) labels.add(def.label);
-    }
-    return [...labels];
-  }, [fields]);
+  /** Field types present in this form that cannot be published yet —
+   *  capability-aware (file upload / signature / the 008 types while
+   *  migration 008 awaits the owner's apply). */
+  const blockedTypes = useMemo(
+    () => blockedTypeLabelsFor(fields, v008),
+    [fields, v008],
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -333,6 +412,23 @@ export function FormDetail({ formId }: { formId: string }) {
           : "",
       );
       setFormMode(formRes.data.settings?.mode === "card" ? "card" : "standard");
+      const savedWelcome = formRes.data.settings?.welcome;
+      if (savedWelcome && typeof savedWelcome === "object" && !Array.isArray(savedWelcome)) {
+        const w = savedWelcome as Record<string, unknown>;
+        setWelcomeOn(w.enabled === true);
+        setWelcomeTitle(typeof w.title === "string" ? w.title : "");
+        setWelcomeDescription(typeof w.description === "string" ? w.description : "");
+        setWelcomeButton(typeof w.button_label === "string" ? w.button_label : "");
+      }
+      const savedThankyou = formRes.data.settings?.thankyou;
+      if (savedThankyou && typeof savedThankyou === "object" && !Array.isArray(savedThankyou)) {
+        const t = savedThankyou as Record<string, unknown>;
+        setThankyouOn(t.enabled === true);
+        setThankyouTitle(typeof t.title === "string" ? t.title : "");
+        setThankyouDescription(typeof t.description === "string" ? t.description : "");
+        setThankyouButton(typeof t.button_label === "string" ? t.button_label : "");
+        setThankyouLink(typeof t.link_url === "string" ? t.link_url : "");
+      }
 
       if (fieldsRes.error) throw fieldsRes.error;
       setFields((fieldsRes.data as FormField[]) ?? []);
@@ -440,6 +536,23 @@ export function FormDetail({ formId }: { formId: string }) {
     // snapshot (006 snapshots settings wholesale) and the public form.
     if (formMode === "card") nextSettings.mode = "card";
     else delete nextSettings.mode;
+
+    // Welcome / thank-you screens — same delete-when-default convention.
+    if (welcomeOn) {
+      const w: Record<string, unknown> = { enabled: true };
+      if (welcomeTitle.trim()) w.title = welcomeTitle.trim().slice(0, 200);
+      if (welcomeDescription.trim()) w.description = welcomeDescription.trim().slice(0, 1000);
+      if (welcomeButton.trim()) w.button_label = welcomeButton.trim().slice(0, 40);
+      nextSettings.welcome = w;
+    } else delete nextSettings.welcome;
+    if (thankyouOn) {
+      const t: Record<string, unknown> = { enabled: true };
+      if (thankyouTitle.trim()) t.title = thankyouTitle.trim().slice(0, 200);
+      if (thankyouDescription.trim()) t.description = thankyouDescription.trim().slice(0, 1000);
+      if (thankyouButton.trim()) t.button_label = thankyouButton.trim().slice(0, 40);
+      if (/^https:\/\//.test(thankyouLink.trim())) t.link_url = thankyouLink.trim().slice(0, 2048);
+      nextSettings.thankyou = t;
+    } else delete nextSettings.thankyou;
 
     const { error } = await supabaseBrowser
       .from("forms")
@@ -735,7 +848,6 @@ export function FormDetail({ formId }: { formId: string }) {
   const busyAny =
     savingForm || deletingForm || addingField !== null || deleteFieldBusy;
   const libraryDisabled = addingField !== null || deletingForm || savingForm;
-
   // Draft form header for the preview — built from the CURRENT editor
   // state (name, description, submit label, mode), never the stale
   // saved row, so "exactly what respondents will see" is honest while
@@ -743,7 +855,17 @@ export function FormDetail({ formId }: { formId: string }) {
   const previewForm: RenderableFormHeader = {
     name,
     description: description || null,
-    settings: previewSettingsFor(form.settings, submitLabel, formMode),
+    settings: previewSettingsFor(form.settings, submitLabel, formMode, {
+      welcomeOn,
+      welcomeTitle,
+      welcomeDescription,
+      welcomeButton,
+      thankyouOn,
+      thankyouTitle,
+      thankyouDescription,
+      thankyouButton,
+      thankyouLink,
+    }),
   };
 
   return (
@@ -864,13 +986,13 @@ export function FormDetail({ formId }: { formId: string }) {
 
       {/* ================= Fixed-height workspace ================= */}
       <div className="flex min-h-0 flex-1 gap-3 sm:gap-4">
-        {/* ── Left: field library (lg+) — rail or pinned pane ── */}
+        {/* ── Left: field library (lg+) — ALWAYS EXPANDED (owner
+            directive: no shrink/collapse option) ── */}
         <LibraryPane
-          pinned={libraryPinned}
-          onTogglePin={toggleLibraryPinned}
           onAdd={addField}
           disabled={libraryDisabled}
           fieldCount={fields.length}
+          groups={gatedLibraryGroups}
         />
 
         {/* ── Center: live canvas (own scroll context) ── */}
@@ -1014,6 +1136,14 @@ export function FormDetail({ formId }: { formId: string }) {
             description={description}
             submitLabel={submitLabel}
             formMode={formMode}
+            screens={{
+              welcomeOn, welcomeTitle, welcomeDescription, welcomeButton,
+              thankyouOn, thankyouTitle, thankyouDescription, thankyouButton, thankyouLink,
+            }}
+            onScreens={{
+              setWelcomeOn, setWelcomeTitle, setWelcomeDescription, setWelcomeButton,
+              setThankyouOn, setThankyouTitle, setThankyouDescription, setThankyouButton, setThankyouLink,
+            }}
             onName={setName}
             onDescription={setDescription}
             onSubmitLabel={setSubmitLabel}
@@ -1046,6 +1176,7 @@ export function FormDetail({ formId }: { formId: string }) {
                 onAdd={addField}
                 disabled={addingField !== null}
                 fieldCount={fields.length}
+                groups={gatedLibraryGroups}
               />
             </div>
           </SheetContent>
@@ -1209,194 +1340,44 @@ export function FormDetail({ formId }: { formId: string }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Library pane — collapsible rail (default) or pinned panel           */
+/* Library pane — fixed, ALWAYS-EXPANDED panel                         */
+/*                                                                      */
+/* Owner directive (2026-09-05): the Add Fields section never shrinks. */
+/* The previous 56px icon-rail + hover-overlay + pin/collapse modes    */
+/* were removed. Desktop lg+ always shows the full 256px library with */
+/* search, groups and descriptions; tablet/mobile keep the Sheet.     */
 /* ------------------------------------------------------------------ */
 
-/**
- * The desktop field library home. Two deliberate modes:
- *
- *   RAIL (default) — a 56px icon strip. Hovering anywhere on it (or
- *   pressing its search button) expands the full library as a floating
- *   overlay beside the rail; clicking a rail icon adds that field in
- *   one click. Escape or mouse-out collapses it again. The canvas
- *   keeps its full width while collapsed.
- *
- *   PINNED — a fixed 240px pane with search, groups and descriptions.
- *   The pin preference persists (localStorage), honoring "the user can
- *   deliberately pin/open it".
- */
 function LibraryPane({
-  pinned,
-  onTogglePin,
   onAdd,
   disabled,
   fieldCount,
+  groups,
 }: {
-  pinned: boolean;
-  onTogglePin: () => void;
   onAdd: (entry: LibraryEntry) => void;
   disabled: boolean;
   fieldCount: number;
+  groups: { key: FieldGroup; label: string; items: LibraryEntry[] }[];
 }) {
-  const [open, setOpen] = useState(false);
-  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const cancelClose = useCallback(() => {
-    if (closeTimer.current) {
-      clearTimeout(closeTimer.current);
-      closeTimer.current = null;
-    }
-  }, []);
-
-  const openNow = useCallback(() => {
-    cancelClose();
-    setOpen(true);
-  }, [cancelClose]);
-
-  const scheduleClose = useCallback(() => {
-    cancelClose();
-    closeTimer.current = setTimeout(() => setOpen(false), 200);
-  }, [cancelClose]);
-
-  useEffect(() => {
-    return () => cancelClose();
-  }, [cancelClose]);
-
-  /** Open the overlay AND focus its search input (keyboard path). */
-  function openAndFocusSearch() {
-    openNow();
-    window.requestAnimationFrame(() => {
-      const el = document.querySelector(
-        'input[aria-label="Search field types"]',
-      ) as HTMLInputElement | null;
-      el?.focus();
-    });
-  }
-
-  if (pinned) {
-    return (
-      <aside
-        className="hidden w-60 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex"
-        aria-label="Field library"
-      >
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-foreground/10 px-3 py-2.5">
-          <div className="min-w-0">
-            <p className="font-display text-sm font-bold">Add fields</p>
-            <p className="text-[11px] text-muted-foreground">Click to append</p>
-          </div>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onTogglePin}
-            aria-label="Collapse field library to icon rail"
-            title="Collapse to icon rail"
-          >
-            <PanelLeftClose className="h-4 w-4" />
-          </Button>
-        </div>
-        <div className="min-h-0 flex-1">
-          <FieldLibrary onAdd={onAdd} disabled={disabled} fieldCount={fieldCount} />
-        </div>
-      </aside>
-    );
-  }
-
   return (
     <aside
-      className="relative hidden w-14 shrink-0 lg:block"
+      className="hidden w-64 shrink-0 flex-col overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface lg:flex"
       aria-label="Field library"
-      onMouseLeave={scheduleClose}
     >
-      {/* ── The rail (always visible, 56px) ── */}
-      <div
-        className="flex h-full w-14 flex-col items-center gap-1 overflow-y-auto rounded-2xl border-2 border-foreground/10 bg-surface py-2"
-        onMouseEnter={openNow}
-      >
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={onTogglePin}
-          aria-label="Pin field library open"
-          title="Pin library open"
-        >
-          <PanelLeftOpen className="h-4 w-4" />
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={openAndFocusSearch}
-          aria-label="Search field types"
-          title="Search field types"
-        >
-          <Search className="h-4 w-4" />
-        </Button>
-        <div className="my-1 h-0.5 w-6 shrink-0 rounded bg-foreground/10" aria-hidden />
-
-        {FIELD_GROUPS.map((group) => (
-          <div key={group.key} className="flex w-full flex-col items-center gap-0.5">
-            <p
-              className="mt-1 w-full text-center text-[9px] font-semibold uppercase tracking-wide text-muted-foreground/60"
-              title={group.label}
-            >
-              {group.label}
-            </p>
-            {LIBRARY_BY_GROUP[group.key].map((t) => {
-              const Icon = t.icon;
-              return (
-                <button
-                  key={t.key}
-                  type="button"
-                  onClick={() => onAdd(t)}
-                  disabled={disabled}
-                  className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-[color:var(--memphis-coral)]/12 hover:text-[color:var(--memphis-coral)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                  aria-label={`Add ${t.label} field`}
-                  title={`${t.label} — ${t.description}`}
-                >
-                  <Icon className="h-4 w-4" />
-                </button>
-              );
-            })}
-          </div>
-        ))}
-
-        <div className="mt-auto shrink-0 pt-2 text-center text-[10px] font-semibold text-muted-foreground/70">
-          {fieldCount}
-        </div>
-      </div>
-
-      {/* ── The floating overlay (hover / search / focus) ── */}
-      <div
-        role="region"
-        aria-label="Field library panel"
-        className={cn(
-          "absolute inset-y-0 left-14 z-40 flex w-64 flex-col rounded-2xl border-2 border-foreground/10 bg-surface shadow-[6px_6px_0_0_var(--memphis-ink)] transition-all duration-150",
-          open
-            ? "pointer-events-auto translate-x-0 opacity-100"
-            : "pointer-events-none -translate-x-2 opacity-0",
-        )}
-        onMouseEnter={openNow}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") {
-            e.stopPropagation();
-            setOpen(false);
-          }
-        }}
-      >
-        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-foreground/10 px-3 py-2.5">
+      <div className="flex shrink-0 items-center gap-2 border-b border-foreground/10 px-3 py-2.5">
+        <div className="min-w-0">
           <p className="font-display text-sm font-bold">Add fields</p>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            onClick={onTogglePin}
-            aria-label="Pin field library open"
-            title="Keep the library open"
-          >
-            <PanelLeftOpen className="h-4 w-4" />
-          </Button>
+          <p className="text-[11px] text-muted-foreground">Click to append</p>
         </div>
-        <div className="min-h-0 flex-1">
-          <FieldLibrary onAdd={onAdd} disabled={disabled} fieldCount={fieldCount} />
-        </div>
+        <span
+          className="ml-auto shrink-0 rounded-md bg-foreground/5 px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground"
+          aria-label={`${fieldCount} fields in this form`}
+        >
+          {fieldCount}
+        </span>
+      </div>
+      <div className="min-h-0 flex-1">
+        <FieldLibrary onAdd={onAdd} disabled={disabled} fieldCount={fieldCount} groups={groups} />
       </div>
     </aside>
   );
@@ -1527,6 +1508,8 @@ function PropertiesPanel({
   description,
   submitLabel,
   formMode,
+  screens,
+  onScreens,
   onName,
   onDescription,
   onSubmitLabel,
@@ -1549,6 +1532,8 @@ function PropertiesPanel({
   description: string;
   submitLabel: string;
   formMode: "standard" | "card";
+  screens: ScreenDrafts;
+  onScreens: ScreenDraftSetters;
   onName: (v: string) => void;
   onDescription: (v: string) => void;
   onSubmitLabel: (v: string) => void;
@@ -1599,6 +1584,8 @@ function PropertiesPanel({
             description={description}
             submitLabel={submitLabel}
             formMode={formMode}
+            screens={screens}
+            onScreens={onScreens}
             onName={onName}
             onDescription={onDescription}
             onSubmitLabel={onSubmitLabel}
@@ -1622,6 +1609,8 @@ function FormSettingsView({
   description,
   submitLabel,
   formMode,
+  screens,
+  onScreens,
   onName,
   onDescription,
   onSubmitLabel,
@@ -1638,6 +1627,8 @@ function FormSettingsView({
   description: string;
   submitLabel: string;
   formMode: "standard" | "card";
+  screens: ScreenDrafts;
+  onScreens: ScreenDraftSetters;
   onName: (v: string) => void;
   onDescription: (v: string) => void;
   onSubmitLabel: (v: string) => void;
@@ -1808,6 +1799,140 @@ function FormSettingsView({
             How the form is presented to respondents — save and preview to see it.
           </p>
         </div>
+
+        {/* ── Welcome screen ── */}
+        <div className="space-y-2.5 border-t border-foreground/10 pt-4">
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-foreground/10 bg-background p-3">
+            <div>
+              <p className="text-xs font-semibold text-foreground">Welcome screen</p>
+              <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                A start screen before the first question — title, description, call to action
+              </p>
+            </div>
+            <Switch
+              checked={screens.welcomeOn}
+              onCheckedChange={onScreens.setWelcomeOn}
+              disabled={saving}
+              aria-label="Enable welcome screen"
+            />
+          </div>
+          {screens.welcomeOn && (
+            <div className="space-y-2.5 rounded-xl border border-foreground/10 bg-background p-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="welcome-title">Welcome title</Label>
+                <Input
+                  id="welcome-title"
+                  value={screens.welcomeTitle}
+                  onChange={(e) => onScreens.setWelcomeTitle(e.target.value)}
+                  disabled={saving}
+                  className="h-9"
+                  placeholder={name || "Welcome"}
+                  maxLength={200}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="welcome-description">Welcome description</Label>
+                <Textarea
+                  id="welcome-description"
+                  value={screens.welcomeDescription}
+                  onChange={(e) => onScreens.setWelcomeDescription(e.target.value)}
+                  disabled={saving}
+                  rows={2}
+                  placeholder={description || "Shown under the welcome title"}
+                  maxLength={1000}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="welcome-button">Start button label</Label>
+                <Input
+                  id="welcome-button"
+                  value={screens.welcomeButton}
+                  onChange={(e) => onScreens.setWelcomeButton(e.target.value)}
+                  disabled={saving}
+                  className="h-9"
+                  placeholder="Start"
+                  maxLength={40}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* ── Thank-you screen ── */}
+        <div className="space-y-2.5 border-t border-foreground/10 pt-4">
+          <div className="flex items-center justify-between gap-3 rounded-xl border border-foreground/10 bg-background p-3">
+            <div>
+              <p className="text-xs font-semibold text-foreground">Thank-you screen</p>
+              <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                What respondents see after a successful submit
+              </p>
+            </div>
+            <Switch
+              checked={screens.thankyouOn}
+              onCheckedChange={onScreens.setThankyouOn}
+              disabled={saving}
+              aria-label="Enable thank-you screen"
+            />
+          </div>
+          {screens.thankyouOn && (
+            <div className="space-y-2.5 rounded-xl border border-foreground/10 bg-background p-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="thankyou-title">Thank-you title</Label>
+                <Input
+                  id="thankyou-title"
+                  value={screens.thankyouTitle}
+                  onChange={(e) => onScreens.setThankyouTitle(e.target.value)}
+                  disabled={saving}
+                  className="h-9"
+                  placeholder="Thank you — response received"
+                  maxLength={200}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="thankyou-description">Thank-you description</Label>
+                <Textarea
+                  id="thankyou-description"
+                  value={screens.thankyouDescription}
+                  onChange={(e) => onScreens.setThankyouDescription(e.target.value)}
+                  disabled={saving}
+                  rows={2}
+                  placeholder="Shown under the title with the reference number"
+                  maxLength={1000}
+                />
+              </div>
+              <div className="grid grid-cols-1 gap-2.5">
+                <div className="space-y-1.5">
+                  <Label htmlFor="thankyou-link">Follow-up link (https://…)</Label>
+                  <Input
+                    id="thankyou-link"
+                    type="url"
+                    value={screens.thankyouLink}
+                    onChange={(e) => onScreens.setThankyouLink(e.target.value)}
+                    disabled={saving}
+                    className="h-9"
+                    placeholder="https://example.com"
+                    maxLength={2048}
+                  />
+                </div>
+                {/^https:\/\//.test(screens.thankyouLink.trim()) && (
+                  <div className="space-y-1.5">
+                    <Label htmlFor="thankyou-button">Link label</Label>
+                    <Input
+                      id="thankyou-button"
+                      value={screens.thankyouButton}
+                      onChange={(e) => onScreens.setThankyouButton(e.target.value)}
+                      disabled={saving}
+                      className="h-9"
+                      placeholder="Continue"
+                      maxLength={40}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
         <div className="flex items-center justify-between gap-3">
           <p className="text-[11px] text-muted-foreground" role="status">
             {dirty ? "Unsaved changes" : "Saved to database"}
@@ -2019,6 +2144,18 @@ function FieldRendererForCanvas({
   saving: boolean;
 }) {
   const id = `canvas-${field.field_key}`;
+  if (field.field_type === "embed") {
+    return (
+      <div>
+        <EmbedBlock field={field} mode="builder" />
+        {selected && (
+          <p className="mt-1.5 text-center text-[11px] font-medium text-[color:var(--memphis-violet)]">
+            Presentation block — collects no data
+          </p>
+        )}
+      </div>
+    );
+  }
   if (field.field_type === "section") {
     return (
       <div>

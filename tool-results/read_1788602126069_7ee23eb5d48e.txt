@@ -1,0 +1,762 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→/**
+     4→     4→ * FormNull — Field Property Editor (Field System 2.0)
+     5→     5→ * =====================================================================
+     6→     6→ * THE generic, schema-driven properties panel. It renders EXACTLY the
+     7→     7→ * sections and properties declared by the field type's FieldTypeDef —
+     8→     8→ * no hand-written per-type if/else chains, no irrelevant controls.
+     9→     9→ *
+    10→    10→ * State discipline (directive Part 12 — stale-config bleed prevention):
+    11→    11→ *   - The draft is derived from the `field` prop at MOUNT.
+    12→    12→ *   - The parent renders this editor with key={field.id}, so switching
+    13→    13→ *     selection fully remounts it — Field A's draft can never leak
+    14→    14→ *     into Field B.
+    15→    15→ *   - A belt-and-suspenders effect re-derives the draft if field.id
+    16→    16→ *     ever changes without a remount, and reports clean dirty state.
+    17→    17→ *   - Unsaved changes are guarded by the parent's discard dialog; this
+    18→    18→ *     editor never silently drops them.
+    19→    19→ *
+    20→    20→ * Config hygiene: declared config keys emptied by the user are removed
+    21→    21→ * (never persisted as null); config keys NOT declared for the type are
+    22→    22→ * preserved untouched — that is the legacy-compatibility path for
+    23→    23→ * pre-rebuild fields (e.g. phone length rules written before this
+    24→    24→ * rebuild keep validating server-side).
+    25→    25→ */
+    26→    26→import { useMemo, useState } from "react";
+    27→    27→import { Button } from "@/components/ui/button";
+    28→    28→import { Input } from "@/components/ui/input";
+    29→    29→import { Label } from "@/components/ui/label";
+    30→    30→import { Textarea } from "@/components/ui/textarea";
+    31→    31→import { Switch } from "@/components/ui/switch";
+    32→    32→import {
+    33→    33→  Select,
+    34→    34→  SelectContent,
+    35→    35→  SelectItem,
+    36→    36→  SelectTrigger,
+    37→    37→  SelectValue,
+    38→    38→} from "@/components/ui/select";
+    39→    39→import type { Database } from "@/lib/supabase/types";
+    40→    40→import {
+    41→    41→  fieldDef,
+    42→    42→  validateConfig,
+    43→    43→  validateWidth,
+    44→    44→  validateOptions,
+    45→    45→  PROPERTY_SECTION_ORDER,
+    46→    46→  SECTION_LABELS,
+    47→    47→  MAX_LABEL_LEN,
+    48→    48→  MAX_TEXT_LEN,
+    49→    49→  type PropertyDefinition,
+    50→    50→  type FieldTypeDef,
+    51→    51→} from "./field-registry";
+    52→    52→import { OptionListEditor, configToRows, rowsToConfig, type OptionRow } from "./option-editor";
+    53→    53→import { COUNTRIES, countryByIso } from "./country-data";
+    54→    54→import { cn } from "@/lib/utils";
+    55→    55→
+    56→    56→type FormField = Database["public"]["Tables"]["form_fields"]["Row"];
+    57→    57→
+    58→    58→interface EditableDraft {
+    59→    59→  label: string;
+    60→    60→  description: string;
+    61→    61→  placeholder: string;
+    62→    62→  help_text: string;
+    63→    63→  is_required: boolean;
+    64→    64→  width: number;
+    65→    65→  config: Record<string, unknown>;
+    66→    66→}
+    67→    67→
+    68→    68→/** The save payload — nullable columns, cleaned config. */
+    69→    69→export interface FieldDraft {
+    70→    70→  label: string;
+    71→    71→  description: string | null;
+    72→    72→  placeholder: string | null;
+    73→    73→  help_text: string | null;
+    74→    74→  is_required: boolean;
+    75→    75→  width: number;
+    76→    76→  config: Record<string, unknown>;
+    77→    77→}
+    78→    78→
+    79→    79→/** Deep-copy a JSON-safe config so drafts never share object identity
+    80→    80→ *  with saved rows (duplicate/config-copy isolation). */
+    81→    81→function cloneConfig(config: Record<string, unknown> | null | undefined): Record<string, unknown> {
+    82→    82→  if (!config || typeof config !== "object") return {};
+    83→    83→  return JSON.parse(JSON.stringify(config)) as Record<string, unknown>;
+    84→    84→}
+    85→    85→
+    86→    86→function draftFromField(field: FormField): EditableDraft {
+    87→    87→  return {
+    88→    88→    label: field.label,
+    89→    89→    description: field.description ?? "",
+    90→    90→    placeholder: field.placeholder ?? "",
+    91→    91→    help_text: field.help_text ?? "",
+    92→    92→    is_required: field.is_required,
+    93→    93→    width: field.width,
+    94→    94→    config: cloneConfig(field.config),
+    95→    95→  };
+    96→    96→}
+    97→    97→
+    98→    98→const WIDTH_CHOICES: { value: string; label: string }[] = [
+    99→    99→  { value: "12", label: "Full width" },
+   100→   100→  { value: "9", label: "Three quarters" },
+   101→   101→  { value: "8", label: "Two thirds" },
+   102→   102→  { value: "6", label: "Half" },
+   103→   103→  { value: "4", label: "One third" },
+   104→   104→  { value: "3", label: "One quarter" },
+   105→   105→];
+   106→   106→
+   107→   107→export function FieldPropertyEditor({
+   108→   108→  field,
+   109→   109→  saving,
+   110→   110→  onSave,
+   111→   111→  onCancel,
+   112→   112→  onDirtyChange,
+   113→   113→}: {
+   114→   114→  field: FormField;
+   115→   115→  saving: boolean;
+   116→   116→  onSave: (draft: FieldDraft) => Promise<boolean>;
+   117→   117→  onCancel: () => void;
+   118→   118→  onDirtyChange?: (dirty: boolean) => void;
+   119→   119→}) {
+   120→   120→  const def: FieldTypeDef = useMemo(() => fieldDef(field.field_type), [field.field_type]);
+   121→   121→
+   122→   122→  const [draft, setDraft] = useState<EditableDraft>(() => draftFromField(field));
+   123→   123→  const [validationError, setValidationError] = useState<string | null>(null);
+   124→   124→  const [optionError, setOptionError] = useState<string | null>(null);
+   125→   125→
+   126→   126→  // The parent renders this editor with key={field.id}, so a selection
+   127→   127→  // switch fully remounts it (the primary stale-state defense). This
+   128→   128→  // render-phase adjustment is the belt-and-suspenders layer for any
+   129→   129→  // render path that ever changes the field identity WITHOUT a
+   130→   130→  // remount: re-derive the draft during render (React's documented
+   131→   131→  // "adjust state when a prop changes" pattern — no cascading effect).
+   132→   132→  const [derivedFromId, setDerivedFromId] = useState(field.id);
+   133→   133→  if (derivedFromId !== field.id) {
+   134→   134→    setDerivedFromId(field.id);
+   135→   135→    setDraft(draftFromField(field));
+   136→   136→    setValidationError(null);
+   137→   137→    setOptionError(null);
+   138→   138→  }
+   139→   139→
+   140→   140→  function patch(p: Partial<EditableDraft>) {
+   141→   141→    setDraft((d) => ({ ...d, ...p }));
+   142→   142→    setValidationError(null);
+   143→   143→    onDirtyChange?.(true);
+   144→   144→  }
+   145→   145→
+   146→   146→  function patchConfig(p: Record<string, unknown>) {
+   147→   147→    setDraft((d) => ({ ...d, config: { ...d.config, ...p } }));
+   148→   148→    setValidationError(null);
+   149→   149→    onDirtyChange?.(true);
+   150→   150→  }
+   151→   151→
+   152→   152→  async function save() {
+   153→   153→    const label = draft.label.trim();
+   154→   154→    if (!label) {
+   155→   155→      setValidationError("Label is required.");
+   156→   156→      return;
+   157→   157→    }
+   158→   158→    if (label.length > MAX_LABEL_LEN) {
+   159→   159→      setValidationError(`Label must be at most ${MAX_LABEL_LEN} characters.`);
+   160→   160→      return;
+   161→   161→    }
+   162→   162→    for (const [k, v] of [
+   163→   163→      ["Description", draft.description],
+   164→   164→      ["Placeholder", draft.placeholder],
+   165→   165→      ["Help text", draft.help_text],
+   166→   166→    ] as const) {
+   167→   167→      if (v && v.length > MAX_TEXT_LEN) {
+   168→   168→        setValidationError(`${k} must be at most ${MAX_TEXT_LEN} characters.`);
+   169→   169→        return;
+   170→   170→      }
+   171→   171→    }
+   172→   172→    const widthCheck = validateWidth(draft.width);
+   173→   173→    if (!widthCheck.ok) {
+   174→   174→      setValidationError(widthCheck.message ?? "Invalid width.");
+   175→   175→      return;
+   176→   176→    }
+   177→   177→
+   178→   178→    // Option invariants first (better message than the generic check).
+   179→   179→    if (def.value === "single_select" || def.value === "multi_select") {
+   180→   180→      const rows = configToRows(draft.config);
+   181→   181→      const { values, labels } = rowsToConfig(rows);
+   182→   182→      const optCheck = validateOptions(values, labels);
+   183→   183→      if (!optCheck.ok) {
+   184→   184→        setOptionError(optCheck.message ?? "Invalid options.");
+   185→   185→        setValidationError(optCheck.message ?? "Invalid options.");
+   186→   186→        return;
+   187→   187→      }
+   188→   188→      setOptionError(null);
+   189→   189→    }
+   190→   190→
+   191→   191→    const cleaned = cleanConfig(def, draft.config);
+   192→   192→    const configCheck = validateConfig(field.field_type, cleaned);
+   193→   193→    if (!configCheck.ok) {
+   194→   194→      setValidationError(configCheck.message ?? "Invalid configuration.");
+   195→   195→      return;
+   196→   196→    }
+   197→   197→
+   198→   198→    const ok = await onSave({
+   199→   199→      label,
+   200→   200→      description: draft.description.trim() || null,
+   201→   201→      placeholder: draft.placeholder.trim() || null,
+   202→   202→      help_text: draft.help_text.trim() || null,
+   203→   203→      is_required: draft.is_required,
+   204→   204→      width: draft.width,
+   205→   205→      config: cleaned,
+   206→   206→    });
+   207→   207→    if (ok) {
+   208→   208→      onDirtyChange?.(false);
+   209→   209→      setValidationError(null);
+   210→   210→    }
+   211→   211→  }
+   212→   212→
+   213→   213→  // Group properties by section, in canonical order.
+   214→   214→  const sections = useMemo(() => {
+   215→   215→    const map = new Map<string, { title: string; props: PropertyDefinition[] }>();
+   216→   216→    for (const s of PROPERTY_SECTION_ORDER) {
+   217→   217→      const props = def.properties.filter(
+   218→   218→        (p) =>
+   219→   219→          p.section === s &&
+   220→   220→          !(p.visibleWhenPresent && draft.config[p.key] == null),
+   221→   221→      );
+   222→   222→      if (props.length > 0) map.set(s, { title: SECTION_LABELS[s], props });
+   223→   223→    }
+   224→   224→    return [...map.values()];
+   225→   225→  }, [def, draft.config]);
+   226→   226→
+   227→   227→  const columnValue = (key: string): string => {
+   228→   228→    switch (key) {
+   229→   229→      case "label": return draft.label;
+   230→   230→      case "description": return draft.description;
+   231→   231→      case "placeholder": return draft.placeholder;
+   232→   232→      case "help_text": return draft.help_text;
+   233→   233→      default: return "";
+   234→   234→    }
+   235→   235→  };
+   236→   236→
+   237→   237→  function patchDraftColumn(key: string, value: string) {
+   238→   238→    patch({ [key]: value } as Partial<EditableDraft>);
+   239→   239→  }
+   240→   240→
+   241→   241→  return (
+   242→   242→    <div className="space-y-5">
+   243→   243→      {/* Type header — what the user is configuring */}
+   244→   244→      <div className="flex items-center gap-2.5 rounded-xl bg-surface p-2.5">
+   245→   245→        <span
+   246→   246→          className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[color:var(--memphis-coral)]/12 text-[color:var(--memphis-coral)]"
+   247→   247→          aria-hidden
+   248→   248→        >
+   249→   249→          <def.icon className="h-4 w-4" />
+   250→   250→        </span>
+   251→   251→        <div className="min-w-0">
+   252→   252→          <p className="text-sm font-bold text-foreground">
+   253→   253→            {def.label}
+   254→   254→            {def.value === "multi_select" && draft.config.ranked === true && (
+   255→   255→              <span className="ml-1.5 rounded-md bg-[color:var(--memphis-coral)]/12 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[color:var(--memphis-coral)]">
+   256→   256→                Ranking
+   257→   257→              </span>
+   258→   258→            )}
+   259→   259→            {def.value === "scale" && draft.config.style === "slider" && (
+   260→   260→              <span className="ml-1.5 rounded-md bg-[color:var(--memphis-coral)]/12 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[color:var(--memphis-coral)]">
+   261→   261→                Slider
+   262→   262→              </span>
+   263→   263→            )}
+   264→   264→          </p>
+   265→   265→          <p className="truncate font-mono text-[11px] text-muted-foreground" title={field.field_key}>
+   266→   266→            {field.field_key}
+   267→   267→          </p>
+   268→   268→        </div>
+   269→   269→      </div>
+   270→   270→
+   271→   271→      {sections.map((section) => (
+   272→   272→        <section key={section.title} className="space-y-3">
+   273→   273→          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/80">
+   274→   274→            {section.title}
+   275→   275→          </p>
+   276→   276→
+   277→   277→          {section.title === "Validation" && def.validationNote && (
+   278→   278→            <p className="rounded-lg bg-background px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
+   279→   279→              {def.validationNote}
+   280→   280→            </p>
+   281→   281→          )}
+   282→   282→
+   283→   283→          <div className="grid grid-cols-2 gap-3">
+   284→   284→            {section.props.map((prop) => (
+   285→   285→              <PropertyControlShell
+   286→   286→                key={prop.key}
+   287→   287→                prop={prop}
+   288→   288→                draft={draft}
+   289→   289→                columnValue={columnValue(prop.key)}
+   290→   290→                onColumn={(v) => patchDraftColumn(prop.key, v)}
+   291→   291→                onRequired={(v) => patch({ is_required: v })}
+   292→   292→                onWidth={(v) => patch({ width: v })}
+   293→   293→                onConfigValue={(v) => patchConfig({ [prop.key]: v })}
+   294→   294→                onConfigPatch={patchConfig}
+   295→   295→                saving={saving}
+   296→   296→                optionError={prop.control === "options-editor" ? optionError : null}
+   297→   297→              />
+   298→   298→            ))}
+   299→   299→          </div>
+   300→   300→        </section>
+   301→   301→      ))}
+   302→   302→
+   303→   303→      {/* Spacer so the sticky action bar never covers the last controls */}
+   304→   304→      <div aria-hidden className="h-12" />
+   305→   305→
+   306→   306→      {/* Validation error */}
+   307→   307→      {validationError && (
+   308→   308→        <p role="alert" className="text-xs font-medium text-destructive">
+   309→   309→          {validationError}
+   310→   310→        </p>
+   311→   311→      )}
+   312→   312→
+   313→   313→      {/* Actions */}
+   314→   314→      <div className="sticky bottom-0 -mx-4 flex gap-2 border-t border-foreground/10 bg-surface/95 px-4 pt-3 pb-1 backdrop-blur-sm sm:flex-row sm:justify-end">
+   315→   315→        <Button variant="outline" size="sm" onClick={onCancel} disabled={saving} className="flex-1 sm:flex-none">
+   316→   316→          Cancel
+   317→   317→        </Button>
+   318→   318→        <Button variant="memphis-coral" size="sm" onClick={save} disabled={saving} className="flex-1 sm:flex-none">
+   319→   319→          {saving ? "Saving…" : "Save field"}
+   320→   320→        </Button>
+   321→   321→      </div>
+   322→   322→    </div>
+   323→   323→  );
+   324→   324→}
+   325→   325→
+   326→   326→/* ------------------------------------------------------------------ */
+   327→   327→/* Control shell — routes a PropertyDefinition to its widget           */
+   328→   328→/* ------------------------------------------------------------------ */
+   329→   329→
+   330→   330→function PropertyControlShell({
+   331→   331→  prop,
+   332→   332→  draft,
+   333→   333→  columnValue,
+   334→   334→  onColumn,
+   335→   335→  onRequired,
+   336→   336→  onWidth,
+   337→   337→  onConfigValue,
+   338→   338→  onConfigPatch,
+   339→   339→  saving,
+   340→   340→  optionError,
+   341→   341→}: {
+   342→   342→  prop: PropertyDefinition;
+   343→   343→  draft: EditableDraft;
+   344→   344→  columnValue: string;
+   345→   345→  onColumn: (v: string) => void;
+   346→   346→  onRequired: (v: boolean) => void;
+   347→   347→  onWidth: (v: number) => void;
+   348→   348→  onConfigValue: (v: unknown) => void;
+   349→   349→  onConfigPatch: (p: Record<string, unknown>) => void;
+   350→   350→  saving: boolean;
+   351→   351→  optionError: string | null;
+   352→   352→}) {
+   353→   353→  const wrapperClass = cn("space-y-1.5", prop.fullWidth && "col-span-2");
+   354→   354→  const cid = `prop-${prop.key}`; // unique per editor instance (panel renders one field)
+   355→   355→
+   356→   356→  switch (prop.control) {
+   357→   357→    case "text":
+   358→   358→      return (
+   359→   359→        <div className={wrapperClass}>
+   360→   360→          <ControlLabel prop={prop} htmlFor={cid} />
+   361→   361→          <Input
+   362→   362→            id={cid}
+   363→   363→            value={prop.target === "column" ? columnValue : configStr(draft.config[prop.key])}
+   364→   364→            onChange={(e) =>
+   365→   365→              prop.target === "column"
+   366→   366→                ? onColumn(e.target.value)
+   367→   367→                : onConfigValue(e.target.value || null)
+   368→   368→            }
+   369→   369→            disabled={saving}
+   370→   370→            className="h-9"
+   371→   371→            placeholder={prop.placeholder}
+   372→   372→            maxLength={prop.target === "column" ? MAX_TEXT_LEN : MAX_LABEL_LEN}
+   373→   373→          />
+   374→   374→          {prop.hint && <Hint text={prop.hint} />}
+   375→   375→        </div>
+   376→   376→      );
+   377→   377→
+   378→   378→    case "textarea":
+   379→   379→      return (
+   380→   380→        <div className={wrapperClass}>
+   381→   381→          <ControlLabel prop={prop} htmlFor={cid} />
+   382→   382→          <Textarea
+   383→   383→            id={cid}
+   384→   384→            value={prop.target === "column" ? columnValue : configStr(draft.config[prop.key])}
+   385→   385→            onChange={(e) =>
+   386→   386→              prop.target === "column"
+   387→   387→                ? onColumn(e.target.value)
+   388→   388→                : onConfigValue(e.target.value || null)
+   389→   389→            }
+   390→   390→            disabled={saving}
+   391→   391→            rows={2}
+   392→   392→            placeholder={prop.placeholder}
+   393→   393→            maxLength={MAX_TEXT_LEN}
+   394→   394→          />
+   395→   395→          {prop.hint && <Hint text={prop.hint} />}
+   396→   396→        </div>
+   397→   397→      );
+   398→   398→
+   399→   399→    case "number":
+   400→   400→      return (
+   401→   401→        <div className={wrapperClass}>
+   402→   402→          <ControlLabel prop={prop} htmlFor={cid} />
+   403→   403→          <Input
+   404→   404→            id={cid}
+   405→   405→            type="number"
+   406→   406→            value={numStr(draft.config[prop.key])}
+   407→   407→            onChange={(e) =>
+   408→   408→              onConfigValue(e.target.value === "" ? null : Number(e.target.value))
+   409→   409→            }
+   410→   410→            disabled={saving}
+   411→   411→            className="h-9"
+   412→   412→            min={prop.min}
+   413→   413→            max={prop.max}
+   414→   414→            step={prop.step ?? (prop.key === "step" ? "any" : 1)}
+   415→   415→          />
+   416→   416→          {prop.hint && <Hint text={prop.hint} />}
+   417→   417→        </div>
+   418→   418→      );
+   419→   419→
+   420→   420→    case "switch":
+   421→   421→      return (
+   422→   422→        <div className={cn("flex items-center justify-between gap-3 rounded-xl border border-foreground/10 bg-background p-3", prop.fullWidth && "col-span-2")}>
+   423→   423→          {asPlain({ prop })}
+   424→   424→          <Switch
+   425→   425→            checked={draft.is_required}
+   426→   426→            onCheckedChange={onRequired}
+   427→   427→            disabled={saving}
+   428→   428→            aria-label={prop.label}
+   429→   429→          />
+   430→   430→        </div>
+   431→   431→      );
+   432→   432→
+   433→   433→    case "width":
+   434→   434→      return (
+   435→   435→        <div className={wrapperClass}>
+   436→   436→          <ControlLabel prop={prop} htmlFor={cid} />
+   437→   437→          <Select
+   438→   438→            value={String(draft.width)}
+   439→   439→            onValueChange={(v) => onWidth(Number(v))}
+   440→   440→            disabled={saving}
+   441→   441→          >
+   442→   442→            <SelectTrigger id={cid} className="h-9">
+   443→   443→              <SelectValue />
+   444→   444→            </SelectTrigger>
+   445→   445→            <SelectContent>
+   446→   446→              {WIDTH_CHOICES.map((w) => (
+   447→   447→                <SelectItem key={w.value} value={w.value}>
+   448→   448→                  {w.label}
+   449→   449→                </SelectItem>
+   450→   450→              ))}
+   451→   451→            </SelectContent>
+   452→   452→          </Select>
+   453→   453→          {prop.hint && <Hint text={prop.hint} />}
+   454→   454→        </div>
+   455→   455→      );
+   456→   456→
+   457→   457→    case "select":
+   458→   458→      return (
+   459→   459→        <div className={wrapperClass}>
+   460→   460→          <ControlLabel prop={prop} htmlFor={cid} />
+   461→   461→          <Select
+   462→   462→            value={configStr(draft.config[prop.key])}
+   463→   463→            onValueChange={(v) => onConfigValue(v)}
+   464→   464→            disabled={saving}
+   465→   465→          >
+   466→   466→            <SelectTrigger id={cid} className="h-9">
+   467→   467→              <SelectValue placeholder={prop.placeholder ?? "Choose"} />
+   468→   468→            </SelectTrigger>
+   469→   469→            <SelectContent>
+   470→   470→              {prop.choices?.map((c) => (
+   471→   471→                <SelectItem key={c.value} value={c.value}>
+   472→   472→                  {c.label}
+   473→   473→                </SelectItem>
+   474→   474→              ))}
+   475→   475→            </SelectContent>
+   476→   476→          </Select>
+   477→   477→          {prop.hint && <Hint text={prop.hint} />}
+   478→   478→        </div>
+   479→   479→      );
+   480→   480→
+   481→   481→    case "date":
+   482→   482→      return (
+   483→   483→        <div className={wrapperClass}>
+   484→   484→          <ControlLabel prop={prop} htmlFor={cid} />
+   485→   485→          <Input
+   486→   486→            id={cid}
+   487→   487→            type="date"
+   488→   488→            value={configStr(draft.config[prop.key])}
+   489→   489→            onChange={(e) => onConfigValue(e.target.value || null)}
+   490→   490→            disabled={saving}
+   491→   491→            className="h-9"
+   492→   492→          />
+   493→   493→          {prop.hint && <Hint text={prop.hint} />}
+   494→   494→        </div>
+   495→   495→      );
+   496→   496→
+   497→   497→    case "datetime":
+   498→   498→      return (
+   499→   499→        <div className={wrapperClass}>
+   500→   500→          <ControlLabel prop={prop} htmlFor={cid} />
+   501→   501→          <Input
+   502→   502→            id={cid}
+   503→   503→            type="datetime-local"
+   504→   504→            value={configStr(draft.config[prop.key])}
+   505→   505→            onChange={(e) => onConfigValue(e.target.value || null)}
+   506→   506→            disabled={saving}
+   507→   507→            className="h-9"
+   508→   508→          />
+   509→   509→          {prop.hint && <Hint text={prop.hint} />}
+   510→   510→        </div>
+   511→   511→      );
+   512→   512→
+   513→   513→    case "config-switch": {
+   514→   514→      const current =
+   515→   515→        typeof draft.config[prop.key] === "boolean"
+   516→   516→          ? (draft.config[prop.key] as boolean)
+   517→   517→          : (prop.defaultOn ?? false);
+   518→   518→      return (
+   519→   519→        <div
+   520→   520→          className={cn(
+   521→   521→            "flex items-center justify-between gap-3 rounded-xl border border-foreground/10 bg-background p-3",
+   522→   522→            prop.fullWidth && "col-span-2",
+   523→   523→          )}
+   524→   524→        >
+   525→   525→          {asPlain({ prop })}
+   526→   526→          <Switch
+   527→   527→            checked={current}
+   528→   528→            onCheckedChange={(v) => onConfigValue(v)}
+   529→   529→            disabled={saving}
+   530→   530→            aria-label={prop.label}
+   531→   531→          />
+   532→   532→        </div>
+   533→   533→      );
+   534→   534→    }
+   535→   535→
+   536→   536→    case "options-editor":
+   537→   537→      return (
+   538→   538→        <div className={cn(wrapperClass, "col-span-2")}>
+   539→   539→          <OptionsControl
+   540→   540→            config={draft.config}
+   541→   541→            propKey={prop.key}
+   542→   542→            optionKeys={prop.optionKeys}
+   543→   543→            onConfigPatch={onConfigPatch}
+   544→   544→            saving={saving}
+   545→   545→            error={optionError}
+   546→   546→          />
+   547→   547→          {prop.hint && <Hint text={prop.hint} />}
+   548→   548→        </div>
+   549→   549→      );
+   550→   550→
+   551→   551→    case "default-country":
+   552→   552→      return (
+   553→   553→        <div className={cn(wrapperClass, "col-span-2")}>
+   554→   554→          <ControlLabel prop={prop} htmlFor={cid} />
+   555→   555→          <DefaultCountryControl
+   556→   556→            value={draft.config.defaultCountry}
+   557→   557→            onChange={(v) => onConfigValue(v)}
+   558→   558→            disabled={saving}
+   559→   559→          />
+   560→   560→          {prop.hint && <Hint text={prop.hint} />}
+   561→   561→        </div>
+   562→   562→      );
+   563→   563→
+   564→   564→    default:
+   565→   565→      return null;
+   566→   566→  }
+   567→   567→}
+   568→   568→
+   569→   569→/*
+   570→   570→ * Options control container — keeps option rows in LOCAL state (so
+   571→   571→ * per-row flags like valueEdited survive keystrokes) while writing
+   572→   572→ * every change back into the draft config immediately. Parameterized
+   573→   573→ * by the property's optionKeys so matrix rows/columns reuse the exact
+   574→   574→ * same editor. Remounts with the property editor on field switches,
+   575→   575→ * re-deriving rows from the saved config.
+   576→   576→ */
+   577→   577→function OptionsControl({
+   578→   578→  config,
+   579→   579→  propKey,
+   580→   580→  optionKeys,
+   581→   581→  onConfigPatch,
+   582→   582→  saving,
+   583→   583→  error,
+   584→   584→}: {
+   585→   585→  config: Record<string, unknown>;
+   586→   586→  /** Property key — used to pick the item noun (matrix rows/columns). */
+   587→   587→  propKey: string;
+   588→   588→  optionKeys?: { values: string; labels: string };
+   589→   589→  onConfigPatch: (p: Record<string, unknown>) => void;
+   590→   590→  saving: boolean;
+   591→   591→  error: string | null;
+   592→   592→}) {
+   593→   593→  const keys = optionKeys ?? { values: "options", labels: "optionLabels" };
+   594→   594→  const [rows, setRows] = useState<OptionRow[]>(() => configToRows(config, keys));
+   595→   595→  const itemNoun = propKey === "rows" ? "row" : propKey === "columns" ? "column" : "option";
+   596→   596→
+   597→   597→  function update(next: OptionRow[]) {
+   598→   598→    setRows(next);
+   599→   599→    const { values, labels } = rowsToConfig(next, keys);
+   600→   600→    onConfigPatch({ [keys.values]: values, [keys.labels]: labels });
+   601→   601→  }
+   602→   602→
+   603→   603→  return (
+   604→   604→    <OptionListEditor
+   605→   605→      rows={rows}
+   606→   606→      onChange={update}
+   607→   607→      disabled={saving}
+   608→   608→      errors={error}
+   609→   609→      itemNoun={itemNoun}
+   610→   610→    />
+   611→   611→  );
+   612→   612→}
+   613→   613→
+   614→   614→function ControlLabel({ prop, htmlFor }: { prop: PropertyDefinition; htmlFor: string }) {
+   615→   615→  return (
+   616→   616→    <Label htmlFor={htmlFor} className="text-xs">
+   617→   617→      {prop.label}
+   618→   618→    </Label>
+   619→   619→  );
+   620→   620→}
+   621→   621→
+   622→   622→function asPlain({ prop }: { prop: PropertyDefinition }) {
+   623→   623→  return (
+   624→   624→    <div>
+   625→   625→      <p className="text-xs font-semibold text-foreground">{prop.label}</p>
+   626→   626→      {prop.hint && <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{prop.hint}</p>}
+   627→   627→    </div>
+   628→   628→  );
+   629→   629→}
+   630→   630→
+   631→   631→function Hint({ text }: { text: string }) {
+   632→   632→  return <p className="text-[11px] leading-snug text-muted-foreground">{text}</p>;
+   633→   633→}
+   634→   634→
+   635→   635→function configStr(v: unknown): string {
+   636→   636→  return typeof v === "string" ? v : "";
+   637→   637→}
+   638→   638→
+   639→   639→function numStr(v: unknown): string {
+   640→   640→  if (v == null) return "";
+   641→   641→  return String(v);
+   642→   642→}
+   643→   643→
+   644→   644→/* ------------------------------------------------------------------ */
+   645→   645→/* Default country control — auto-detect (browser locale) or specific  */
+   646→   646→/* ------------------------------------------------------------------ */
+   647→   647→
+   648→   648→function DefaultCountryControl({
+   649→   649→  value,
+   650→   650→  onChange,
+   651→   651→  disabled,
+   652→   652→}: {
+   653→   653→  value: unknown;
+   654→   654→  onChange: (v: unknown) => void;
+   655→   655→  disabled: boolean;
+   656→   656→}) {
+   657→   657→  const specific = typeof value === "string" && countryByIso(value) ? true : false;
+   658→   658→  const mode: "auto" | "specific" = specific ? "specific" : "auto";
+   659→   659→
+   660→   660→  return (
+   661→   661→    <div className="space-y-2">
+   662→   662→      <div
+   663→   663→        className="flex rounded-xl border-2 border-foreground/10 bg-background p-1"
+   664→   664→        role="radiogroup"
+   665→   665→        aria-label="Default country mode"
+   666→   666→      >
+   667→   667→        {(
+   668→   668→          [
+   669→   669→            ["auto", "Auto detect"],
+   670→   670→            ["specific", "Specific country"],
+   671→   671→          ] as const
+   672→   672→        ).map(([m, label]) => (
+   673→   673→          <button
+   674→   674→            key={m}
+   675→   675→            type="button"
+   676→   676→            role="radio"
+   677→   677→            aria-checked={mode === m}
+   678→   678→            onClick={() => onChange(m === "auto" ? null : "US")}
+   679→   679→            disabled={disabled}
+   680→   680→            className={cn(
+   681→   681→              "flex-1 rounded-lg px-2 py-1.5 text-xs font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+   682→   682→              mode === m
+   683→   683→                ? "bg-foreground text-background"
+   684→   684→                : "text-muted-foreground hover:text-foreground",
+   685→   685→            )}
+   686→   686→          >
+   687→   687→            {label}
+   688→   688→          </button>
+   689→   689→        ))}
+   690→   690→      </div>
+   691→   691→      {mode === "specific" && (
+   692→   692→        <Select
+   693→   693→          value={typeof value === "string" ? value : "US"}
+   694→   694→          onValueChange={(v) => onChange(v)}
+   695→   695→          disabled={disabled}
+   696→   696→        >
+   697→   697→          <SelectTrigger className="h-9" aria-label="Default country">
+   698→   698→            <SelectValue />
+   699→   699→          </SelectTrigger>
+   700→   700→          <SelectContent className="max-h-72">
+   701→   701→            {COUNTRIES.map((c) => (
+   702→   702→              <SelectItem key={c.iso} value={c.iso}>
+   703→   703→                {c.name} (+{c.dial})
+   704→   704→              </SelectItem>
+   705→   705→            ))}
+   706→   706→          </SelectContent>
+   707→   707→        </Select>
+   708→   708→      )}
+   709→   709→      <p className="text-[11px] leading-snug text-muted-foreground">
+   710→   710→        {mode === "auto"
+   711→   711→          ? "Uses the respondent's browser locale — no network lookup."
+   712→   712→          : "Pre-selects this country's calling code on the public form."}
+   713→   713→      </p>
+   714→   714→    </div>
+   715→   715→  );
+   716→   716→}
+   717→   717→
+   718→   718→/* ------------------------------------------------------------------ */
+   719→   719→/* Config cleaning                                                     */
+   720→   720→/* ------------------------------------------------------------------ */
+   721→   721→
+   722→   722→/**
+   723→   723→ * Remove declared keys the user emptied; preserve everything else.
+   724→   724→ * Option-like pairs (options/optionLabels, rows/rowLabels,
+   725→   725→ * columns/columnLabels) keep their working shapes (validated).
+   726→   726→ */
+   727→   727→function cleanConfig(
+   728→   728→  def: FieldTypeDef,
+   729→   729→  config: Record<string, unknown>,
+   730→   730→): Record<string, unknown> {
+   731→   731→  // Every option pair any property of this type declares.
+   732→   732→  const optionPairs = def.properties
+   733→   733→    .filter((p) => p.control === "options-editor")
+   734→   734→    .map((p) => p.optionKeys ?? { values: "options", labels: "optionLabels" });
+   735→   735→  const pairValues = new Set(optionPairs.flatMap((k) => [k.values, k.labels]));
+   736→   736→  const declared = new Set(
+   737→   737→    def.properties.filter((p) => p.target === "config").map((p) => p.key),
+   738→   738→  );
+   739→   739→  const out: Record<string, unknown> = {};
+   740→   740→  for (const [k, v] of Object.entries(config)) {
+   741→   741→    if (pairValues.has(k)) {
+   742→   742→      // Handled wholesale below.
+   743→   743→      continue;
+   744→   744→    }
+   745→   745→    if (!declared.has(k)) {
+   746→   746→      out[k] = v; // legacy/unknown keys pass through untouched
+   747→   747→      continue;
+   748→   748→    }
+   749→   749→    if (v === null || v === undefined) continue;
+   750→   750→    if (typeof v === "string" && v.trim() === "") continue;
+   751→   751→    out[k] = v;
+   752→   752→  }
+   753→   753→  for (const keys of optionPairs) {
+   754→   754→    const rows = configToRows(config, keys);
+   755→   755→    const { values, labels } = rowsToConfig(rows, keys);
+   756→   756→    if (values.length > 0) {
+   757→   757→      out[keys.values] = values;
+   758→   758→      if (Object.keys(labels).length > 0) out[keys.labels] = labels;
+   759→   759→    }
+   760→   760→  }
+
+[showing lines 1-760 of 763; use offset=761 with limit to continue reading]

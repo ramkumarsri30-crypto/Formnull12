@@ -18,11 +18,19 @@ export type FieldType =
   | "short_text" | "long_text" | "email" | "url" | "phone"
   | "number" | "decimal" | "boolean" | "single_select" | "multi_select"
   | "date" | "datetime" | "time" | "rating" | "scale" | "file_upload"
-  | "section" | "page_break" | "signature" | "address" | "matrix";
+  | "section" | "page_break" | "signature" | "address" | "matrix"
+  // Field Expansion phase (migration 008 — enum values added by
+  // ALTER TYPE; fields of these types cannot be created until 008
+  // is applied, which the builder detects via a runtime capability
+  // probe and gates the library entries honestly):
+  | "contact_info" | "payment" | "scheduler" | "embed";
 export type SubmissionStatus = "pending" | "completed" | "flagged" | "rejected";
 export type AssetKind =
   | "avatar" | "workspace_logo" | "form_asset"
   | "submission_upload" | "export" | "inline_image";
+export type FormUploadStatus = "pending" | "attached" | "orphaned";
+export type PaymentStatus = "pending" | "succeeded" | "failed" | "refunded";
+export type BookingStatus = "booked" | "cancelled";
 
 export interface Database {
   public: {
@@ -279,6 +287,91 @@ export interface Database {
         Update: Partial<Database["public"]["Tables"]["assets"]["Insert"]>;
         Relationships: [];
       };
+      form_uploads: {
+        Row: {
+          id: string;
+          token: string;
+          workspace_id: string;
+          form_id: string;
+          field_key: string;
+          bucket: string;
+          storage_path: string;
+          original_name: string;
+          mime_type: string;
+          size_bytes: number;
+          ip_hash: string | null;
+          status: FormUploadStatus;
+          submission_id: string | null;
+          created_at: string;
+          attached_at: string | null;
+        };
+        Insert: {
+          workspace_id: string;
+          form_id: string;
+          field_key: string;
+          bucket?: string;
+          storage_path: string;
+          original_name: string;
+          mime_type: string;
+          size_bytes: number;
+          status?: FormUploadStatus;
+        };
+        Update: Partial<Database["public"]["Tables"]["form_uploads"]["Insert"]>;
+        Relationships: [];
+      };
+      payments: {
+        Row: {
+          id: string;
+          workspace_id: string;
+          form_id: string;
+          submission_id: string | null;
+          field_key: string;
+          provider: string;
+          provider_ref: string | null;
+          amount_cents: number;
+          currency: string;
+          status: PaymentStatus;
+          created_at: string;
+          updated_at: string;
+        };
+        Insert: {
+          workspace_id: string;
+          form_id: string;
+          field_key: string;
+          provider?: string;
+          provider_ref?: string | null;
+          amount_cents: number;
+          currency: string;
+          status?: PaymentStatus;
+        };
+        Update: Partial<Database["public"]["Tables"]["payments"]["Insert"]>;
+        Relationships: [];
+      };
+      bookings: {
+        Row: {
+          id: string;
+          workspace_id: string;
+          form_id: string;
+          submission_id: string | null;
+          field_key: string;
+          start_at: string;
+          end_at: string;
+          timezone: string;
+          status: BookingStatus;
+          created_at: string;
+        };
+        Insert: {
+          workspace_id: string;
+          form_id: string;
+          field_key: string;
+          start_at: string;
+          end_at: string;
+          timezone: string;
+          status?: BookingStatus;
+        };
+        Update: Partial<Database["public"]["Tables"]["bookings"]["Insert"]>;
+        Relationships: [];
+      };
     };
     Views: Record<string, never>;
     Functions: {
@@ -349,6 +442,48 @@ export interface Database {
           p_meta?: Record<string, unknown> | null;
         };
         Returns: { ok: boolean; reference: number | null };
+      };
+      /**
+       * Anonymous upload intent (migration 008): validates a file
+       * against the PUBLISHED snapshot's file_upload/signature field
+       * config (size + allowed types) BEFORE any bytes move, bounds
+       * pending uploads per hashed IP, and returns an unguessable
+       * token + pending/ storage path the client uploads to with the
+       * anon key (bucket policy allows writes only under pending/).
+       */
+      create_upload_intent: {
+        Args: {
+          p_public_key: string;
+          p_field_key: string;
+          p_file_name: string;
+          p_mime_type: string;
+          p_size_bytes: number;
+        };
+        Returns: {
+          token: string;
+          path: string;
+          max_bytes: number;
+        };
+      };
+      /**
+       * Payment intent (migration 008): creates a PENDING payments row
+       * for a published payment field. The charge itself runs through
+       * Stripe Checkout from the app's /api/payments/checkout route
+       * (requires STRIPE_SECRET_KEY); submit_public_form refuses to
+       * store a required-payment submission until the webhook marks the
+       * matching provider_ref succeeded. Nothing is faked.
+       */
+      create_payment_intent: {
+        Args: {
+          p_public_key: string;
+          p_field_key: string;
+          p_provider_ref: string;
+        };
+        Returns: {
+          payment_id: string;
+          amount_cents: number;
+          currency: string;
+        };
       };
     };
     Enums: {

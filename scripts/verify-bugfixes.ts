@@ -4,21 +4,22 @@
  * Run: bun scripts/verify-bugfixes.ts
  *
  * Verifies (no DB, no network — pure registry logic):
- *   1. FIELD_REGISTRY covers every legal field_type enum value (002)
- *      so fieldDef() can never throw "Unknown field type" and crash
- *      the builder.
+ *   1. FIELD_REGISTRY covers every legal field_type enum value
+ *      (002's 21 values + 008's 4 additions = 25) so fieldDef() can
+ *      never throw "Unknown field type" and crash the builder.
  *   2. Registry flags stay aligned with the live server contract:
- *      006's c_submittable (14 types) + 007's additions (datetime,
- *      address, matrix) = 17 submittable types. Layout types
- *      (section, page_break) and deferred types (file_upload,
- *      signature) are NOT submittable.
+ *      006 (14) + 007 (3) + 008 (4: file_upload, signature,
+ *      contact_info, scheduler) = 21 submittable types. payment and
+ *      embed carry no answer values (gated/presentation types).
  *   3. validateConfig("matrix", …) REJECTS non-string rows/columns
  *      (parity with 007 + selects).
  *   4. Balance-field-type activation (2026-09-05): datetime / matrix /
- *      address / section / page_break are ACTIVE + in the library;
- *      signature stays deferred (compat-only).
+ *      address / section / page_break are ACTIVE + in the library.
  *   5. buildPages partitions page-break forms the way the paged
  *      renderer expects (leading/trailing/consecutive break rules).
+ *   6. Field Expansion (008): the six new capabilities — gating flags,
+ *      config validation parity with migration 008's publish branch,
+ *      and the video-embed allowlist parser.
  */
 import {
   FIELD_REGISTRY,
@@ -29,6 +30,11 @@ import {
   fieldDefSafe,
   isSubmittableType,
   validateConfig,
+  defIsPublishable,
+  libraryEntriesFor,
+  libraryGroupsFor,
+  blockedTypeLabelsFor,
+  parseVideoEmbed,
 } from "../src/features/forms/field-registry";
 import { buildPages } from "../src/features/forms/form-renderer";
 import type { RenderableFormField } from "../src/features/forms/form-renderer";
@@ -44,12 +50,14 @@ function check(name: string, ok: boolean, detail?: string) {
   }
 }
 
-console.log("1) Registry covers the full 002 field_type enum");
+console.log("1) Registry covers the full enum (002 + 008)");
 const ALL_TYPES: FieldType[] = [
   "short_text", "long_text", "email", "url", "phone",
   "number", "decimal", "boolean", "single_select", "multi_select",
   "date", "datetime", "time", "rating", "scale", "file_upload",
   "section", "page_break", "signature", "address", "matrix",
+  // 008 additions
+  "contact_info", "payment", "scheduler", "embed",
 ];
 for (const t of ALL_TYPES) {
   check(`fieldDef("${t}") resolves`, fieldDefSafe(t) !== undefined);
@@ -66,18 +74,20 @@ check(
   }),
 );
 check(
-  "registry has 21 defs (full enum)",
+  "registry has 25 defs (full enum incl. 008)",
   FIELD_REGISTRY.length === ALL_TYPES.length,
   `got ${FIELD_REGISTRY.length}`,
 );
 
-console.log("2) Submittable set mirrors 006 (14) + 007 (3) = 17 types");
+console.log("2) Submittable set mirrors 006 (14) + 007 (3) + 008 (4) = 21 types");
 const SUBMITTABLE_LIVE: FieldType[] = [
   "short_text", "long_text", "email", "url", "phone",
   "number", "decimal", "boolean", "date", "time",
   "single_select", "multi_select", "rating", "scale",
   // 007 additions (migration verified applied 2026-09-05):
   "datetime", "address", "matrix",
+  // 008 additions (server contract = migration 008's c_submittable):
+  "file_upload", "signature", "contact_info", "scheduler",
 ];
 for (const t of ALL_TYPES) {
   const expected = SUBMITTABLE_LIVE.includes(t);
@@ -145,15 +155,14 @@ check(
     isSubmittableType("address"),
 );
 check(
-  "signature stays deferred (status=legacy, not in library)",
-  fieldDef("signature").status === "legacy" &&
-    !ADDABLE_FIELD_TYPES.some((d) => d.value === "signature") &&
-    !LIBRARY_ENTRIES.some((e) => e.type === "signature"),
+  "signature is a real 008-gated def (active, requiresV008)",
+  fieldDef("signature").status === "active" &&
+    fieldDef("signature").requiresV008 === true,
 );
 check(
-  "file_upload stays deferred (publishable=false — 006 block)",
-  !fieldDef("file_upload").publishable &&
-    !ADDABLE_FIELD_TYPES.some((d) => d.value === "file_upload"),
+  "file_upload is a real 008-gated def (active, requiresV008)",
+  fieldDef("file_upload").status === "active" &&
+    fieldDef("file_upload").requiresV008 === true,
 );
 check(
   'layout group exists in FIELD_GROUPS',
@@ -227,6 +236,195 @@ check(
 
 const empty = buildPages([]);
 check("empty form → single empty page", empty.length === 1 && empty[0].length === 0);
+
+console.log("6) Field Expansion (008): gating + config parity + embed parser");
+
+// Capability gating: pre-008 the six new capabilities are hidden and
+// publish-blocked; post-008 they are live. Both directions verified.
+const V008_TYPES: FieldType[] = [
+  "file_upload", "signature", "contact_info", "payment", "scheduler", "embed",
+];
+for (const t of V008_TYPES) {
+  check(`${t} requiresV008`, fieldDef(t).requiresV008 === true);
+  check(
+    `${t} hidden from library pre-008 (v008=false)`,
+    !libraryEntriesFor(false).some((e) => e.type === t),
+  );
+  check(
+    `${t} hidden from library unknown-008 (v008=null)`,
+    !libraryEntriesFor(null).some((e) => e.type === t),
+  );
+  check(
+    `${t} visible in library post-008 (v008=true)`,
+    libraryEntriesFor(true).some((e) => e.type === t),
+  );
+  check(
+    `${t} publish-blocked pre-008`,
+    !defIsPublishable(fieldDef(t), false),
+  );
+  check(
+    `${t} publishable post-008`,
+    defIsPublishable(fieldDef(t), true),
+  );
+}
+check(
+  "blockedTypeLabelsFor: file_upload blocks a mixed form pre-008",
+  blockedTypeLabelsFor(
+    [{ field_type: "short_text" }, { field_type: "file_upload" }],
+    false,
+  ).join() === "File upload",
+);
+check(
+  "blockedTypeLabelsFor: empty post-008",
+  blockedTypeLabelsFor(
+    [{ field_type: "short_text" }, { field_type: "file_upload" }],
+    true,
+  ).length === 0,
+);
+check(
+  "groups with entries only (pre-008): files+advanced absent",
+  !libraryGroupsFor(false).some((g) => g.key === "files" || g.key === "advanced"),
+);
+check(
+  "groups post-008: files+advanced present",
+  libraryGroupsFor(true).some((g) => g.key === "files" && g.items.length === 2) &&
+    libraryGroupsFor(true).some((g) => g.key === "advanced" && g.items.length === 2),
+);
+check(
+  "contact_info lives in the contact group",
+  fieldDef("contact_info").group === "contact",
+);
+check(
+  "embed lives in the layout group",
+  fieldDef("embed").group === "layout",
+);
+check(
+  "payment carries no answer value (submittable=false)",
+  !isSubmittableType("payment") && !isSubmittableType("embed"),
+);
+
+// Config validation parity with 008's publish branches.
+check(
+  "file_upload: maxSizeMb 0 rejected (008: 1..100)",
+  !validateConfig("file_upload", { maxSizeMb: 0 }).ok,
+);
+check(
+  "file_upload: maxFiles 11 rejected (008: 1..10)",
+  !validateConfig("file_upload", { maxFiles: 11 }).ok,
+);
+check(
+  "file_upload: bad MIME entry rejected",
+  !validateConfig("file_upload", { allowedTypes: ["not a mime"] }).ok,
+);
+check(
+  "file_upload: 21 types rejected (008: <= 20)",
+  !validateConfig("file_upload", { allowedTypes: Array.from({ length: 21 }, () => "a/b") }).ok,
+);
+check(
+  "file_upload: valid config accepted",
+  validateConfig("file_upload", { maxSizeMb: 25, maxFiles: 3, multiple: true, allowedTypes: ["image/png", "application/pdf"] }).ok,
+);
+
+check(
+  "contact_info: empty parts rejected",
+  !validateConfig("contact_info", { parts: [] }).ok,
+);
+check(
+  "contact_info: unknown part rejected",
+  !validateConfig("contact_info", { parts: ["nickname"] }).ok,
+);
+check(
+  "contact_info: required outside parts rejected",
+  !validateConfig("contact_info", { parts: ["email"], requiredParts: ["phone"] }).ok,
+);
+check(
+  "contact_info: valid config accepted",
+  validateConfig("contact_info", { parts: ["first_name", "last_name", "email"], requiredParts: ["email"] }).ok,
+);
+
+check(
+  "payment: amount below 50 cents rejected (008 bounds)",
+  !validateConfig("payment", { amountCents: 49, currency: "USD" }).ok,
+);
+check(
+  "payment: unsupported currency rejected",
+  !validateConfig("payment", { amountCents: 1000, currency: "XYZ" }).ok,
+);
+check(
+  "payment: valid config accepted",
+  validateConfig("payment", { amountCents: 2500, currency: "EUR", amountMode: "minimum" }).ok,
+);
+
+check(
+  "scheduler: no days rejected",
+  !validateConfig("scheduler", { days: [], windows: [{ start: "09:00", end: "17:00" }], slotMinutes: 30, timezone: "UTC" }).ok,
+);
+check(
+  "scheduler: overlapping windows rejected",
+  !validateConfig("scheduler", {
+    days: [1], windows: [{ start: "09:00", end: "12:00" }, { start: "11:00", end: "15:00" }],
+    slotMinutes: 30, timezone: "UTC",
+  }).ok,
+);
+check(
+  "scheduler: start >= end rejected",
+  !validateConfig("scheduler", { days: [1], windows: [{ start: "17:00", end: "09:00" }], slotMinutes: 30, timezone: "UTC" }).ok,
+);
+check(
+  "scheduler: slotMinutes below 5 rejected (008: 5..240)",
+  !validateConfig("scheduler", { days: [1], windows: [{ start: "09:00", end: "17:00" }], slotMinutes: 4, timezone: "UTC" }).ok,
+);
+check(
+  "scheduler: valid config accepted",
+  validateConfig("scheduler", {
+    days: [1, 2, 3, 4, 5], windows: [{ start: "09:00", end: "17:00" }],
+    slotMinutes: 30, bufferMinutes: 10, minNoticeHours: 24, maxBookingDays: 60,
+    timezone: "Asia/Kolkata",
+  }).ok,
+);
+
+// Embed parser — the allowlist IS the security boundary.
+check(
+  "parseVideoEmbed: youtube watch URL",
+  parseVideoEmbed("https://www.youtube.com/watch?v=dQw4w9WgXcQ")?.src ===
+    "https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ",
+);
+check(
+  "parseVideoEmbed: youtu.be short URL",
+  parseVideoEmbed("https://youtu.be/dQw4w9WgXcQ")?.provider === "youtube",
+);
+check(
+  "parseVideoEmbed: vimeo URL",
+  parseVideoEmbed("https://vimeo.com/123456789")?.src === "https://player.vimeo.com/video/123456789",
+);
+check(
+  "parseVideoEmbed: http (not https) rejected",
+  parseVideoEmbed("http://www.youtube.com/watch?v=dQw4w9WgXcQ") === null,
+);
+check(
+  "parseVideoEmbed: other host rejected",
+  parseVideoEmbed("https://evil.example.com/embed/dQw4w9WgXcQ") === null,
+);
+check(
+  "parseVideoEmbed: query-injected host rejected",
+  parseVideoEmbed("https://youtube.com.evil.io/watch?v=dQw4w9WgXcQ") === null,
+);
+check(
+  "embed: non-https url rejected",
+  !validateConfig("embed", { embedType: "link", url: "http://example.com" }).ok,
+);
+check(
+  "embed: non-allowlisted video rejected",
+  !validateConfig("embed", { embedType: "video", url: "https://example.com/x" }).ok,
+);
+check(
+  "embed: valid youtube video accepted",
+  validateConfig("embed", { embedType: "video", url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" }).ok,
+);
+check(
+  "embed: link type accepts any https url",
+  validateConfig("embed", { embedType: "link", url: "https://example.com/page" }).ok,
+);
 
 console.log(
   failures === 0

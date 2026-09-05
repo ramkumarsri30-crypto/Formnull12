@@ -46,11 +46,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Star, Heart, ThumbsUp, Circle, Upload, Info } from "lucide-react";
+import { Star, Heart, ThumbsUp, Circle, Upload, Info, CreditCard, ExternalLink, Frame as FrameIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { Database, FieldType } from "@/lib/supabase/types";
 import { PhoneControl } from "./phone-control";
 import { COUNTRIES, countryByIso } from "./country-data";
+import { FileControl } from "./file-control";
+import { SignatureControl } from "./signature-control";
+import { readWelcomeSettings, WelcomeScreen } from "./welcome-thankyou";
+import { parseVideoEmbed } from "./field-registry";
 
 /* ------------------------------------------------------------------ */
 /* Option labels (Field System 2.0) — config.optionLabels maps a      */
@@ -472,9 +476,99 @@ export function validateFieldValue(
       return null;
     }
 
+    /* ── Field Expansion types (server contract = migration 008) ── */
+
+    case "file_upload": {
+      if (!Array.isArray(value)) return "Upload at least one file.";
+      if (value.length === 0) return req ? "This field is required." : null;
+      const maxFiles = intIn(config.maxFiles, 1, 10) ?? 5;
+      if (value.length > maxFiles) {
+        return `At most ${maxFiles} file${maxFiles === 1 ? "" : "s"} allowed.`;
+      }
+      for (const v of value) {
+        if (typeof v !== "object" || v === null || typeof (v as { token?: unknown }).token !== "string") {
+          return "One of the uploads is still in progress.";
+        }
+      }
+      return null;
+    }
+
+    case "signature": {
+      if (typeof value !== "string" || value === "") {
+        return req ? "Please draw your signature." : null;
+      }
+      if (!value.startsWith("data:image/png")) {
+        return "The signature could not be read — clear it and draw again.";
+      }
+      return null;
+    }
+
+    case "contact_info": {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "Fill in your contact details.";
+      }
+      const answer = value as Record<string, unknown>;
+      const part = (k: string): string =>
+        typeof answer[k] === "string" ? (answer[k] as string) : "";
+      const filled = Object.keys(answer).some((k) => part(k).trim() !== "");
+      if (!filled) return req ? "This field is required." : null;
+      const parts = strArray(config.parts);
+      const requiredParts = strArray(config.requiredParts);
+      for (const k of Object.keys(answer)) {
+        if (!["first_name", "last_name", "email", "phone"].includes(k)) {
+          return "Unknown contact part.";
+        }
+        if (part(k).length > 200) return `The ${k.replace("_", " ")} part is too long.`;
+      }
+      for (const rp of requiredParts) {
+        if (!part(rp).trim()) {
+          return `The ${rp.replace("_", " ")} part is required.`;
+        }
+      }
+      if (part("email").trim() && !/^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+[.][A-Za-z]{2,}$/.test(part("email").trim())) {
+        return "Enter a valid email address.";
+      }
+      if (part("phone").trim()) {
+        const digits = (part("phone").match(/\d/g) ?? []).length;
+        if (!/^[+]?[0-9(). -]{5,25}$/.test(part("phone").trim()) || digits < 4 || digits > 15) {
+          return "Enter a valid phone number.";
+        }
+      }
+      // Only enabled parts may appear.
+      if (parts.length > 0 && Object.keys(answer).some((k) => !parts.includes(k))) {
+        return "One of the contact parts is no longer offered.";
+      }
+      return null;
+    }
+
+    case "scheduler": {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "Pick an available time slot.";
+      }
+      const answer = value as Record<string, unknown>;
+      if (typeof answer.start_at !== "string" || answer.start_at === "") {
+        return req ? "Pick an available time slot." : null;
+      }
+      if (Number.isNaN(new Date(answer.start_at).getTime())) {
+        return "The selected slot is not a valid time.";
+      }
+      return null;
+    }
+
     default:
       return null;
   }
+}
+
+/** int config guard shared by the new validation branches. */
+function intIn(v: unknown, min: number, max: number): number | undefined {
+  const n = num(v);
+  return n !== undefined && Number.isInteger(n) && n >= min && n <= max ? n : undefined;
+}
+
+/** string[] config guard (never throws on malformed snapshots). */
+function strArray(v: unknown): string[] {
+  return Array.isArray(v) ? (v as unknown[]).filter((x): x is string => typeof x === "string") : [];
 }
 
 /** Validate every field; returns per-key errors (only failing keys). */
@@ -500,6 +594,9 @@ export function FieldControl({
   onChange,
   disabled,
   id: idOverride,
+  mode = "builder",
+  formPublicKey = "",
+  paymentRef,
 }: {
   field: RenderableFormField;
   value: unknown;
@@ -508,6 +605,14 @@ export function FieldControl({
   /** Unique input id — derived from idPrefix by FieldRenderer so the
       canvas, preview and public page never collide on the same DOM id. */
   id?: string;
+  /** Rendering context — upload/signature/payment controls behave
+   *  differently per surface (builder inert, preview no side effects,
+   *  public fully live). */
+  mode?: FormRendererMode;
+  /** The public form's key (upload-intent RPC needs it). */
+  formPublicKey?: string;
+  /** Set once a payment for THIS form succeeded (public page only). */
+  paymentRef?: string | null;
 }) {
   const t = field.field_type;
   const id = idOverride ?? `fld-${field.field_key}`;
@@ -874,23 +979,68 @@ export function FieldControl({
         />
       );
 
-    case "file_upload": {
-      const types = Array.isArray(cfg.allowedTypes) ? (cfg.allowedTypes as string[]).join(", ") : null;
-      const maxSize = typeof cfg.maxSizeMb === "number" ? cfg.maxSizeMb : null;
+    case "file_upload":
       return (
-        <div className="rounded-xl border-2 border-dashed border-foreground/20 bg-background/60 p-4 text-center">
-          <Upload className="mx-auto h-5 w-5 text-muted-foreground/60" aria-hidden />
-          <p className="mt-1.5 text-sm font-medium text-foreground/80">File upload</p>
-          <p className="text-xs text-muted-foreground">
-            {types ? `${types} · ` : ""}
-            {maxSize ? `up to ${maxSize} MB · ` : ""}
-            not available yet
-          </p>
-        </div>
+        <FileControl
+          id={id}
+          field={field}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          mode={mode}
+          publicKey={formPublicKey}
+        />
       );
-    }
+
+    case "signature":
+      return (
+        <SignatureControl
+          id={id}
+          field={field}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+          mode={mode}
+        />
+      );
+
+    case "contact_info":
+      return (
+        <ContactInfoControl
+          id={id}
+          field={field}
+          cfg={cfg}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+        />
+      );
+
+    case "payment":
+      return (
+        <PaymentDisplay
+          field={field}
+          cfg={cfg}
+          paymentRef={paymentRef}
+        />
+      );
+
+    case "scheduler":
+      return (
+        <SchedulerControl
+          id={id}
+          field={field}
+          cfg={cfg}
+          value={value}
+          onChange={onChange}
+          disabled={disabled}
+        />
+      );
 
     case "section":
+      return null; // layout-only — rendered by FieldRenderer itself
+
+    case "embed":
       return null; // layout-only — rendered by FieldRenderer itself
 
     default:
@@ -1275,6 +1425,399 @@ function AddressControl({
 }
 
 /* ------------------------------------------------------------------ */
+/* ContactInfoControl — composite first/last/email/phone               */
+/*                                                                      */
+/* The answer is a { part: text } record with only the ENABLED parts   */
+/* (config.parts) present. Phone reuses PhoneControl (country select   */
+/* + composed international number); email keeps the shared format     */
+/* validation. Mirrors 008's server branch exactly.                    */
+/* ------------------------------------------------------------------ */
+
+const CONTACT_PART_META: Record<string, { label: string; placeholder: string; autoComplete: string }> = {
+  first_name: { label: "First name", placeholder: "Ada", autoComplete: "given-name" },
+  last_name: { label: "Last name", placeholder: "Lovelace", autoComplete: "family-name" },
+  email: { label: "Email", placeholder: "ada@example.com", autoComplete: "email" },
+  phone: { label: "Phone", placeholder: "", autoComplete: "tel" },
+};
+
+function ContactInfoControl({
+  id,
+  field,
+  cfg,
+  value,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  field: RenderableFormField;
+  cfg: Record<string, unknown>;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const parts = strArray(cfg.parts).filter((p) => p in CONTACT_PART_META);
+  const requiredParts = strArray(cfg.requiredParts);
+  const labels = cfg.partLabels && typeof cfg.partLabels === "object" && !Array.isArray(cfg.partLabels)
+    ? (cfg.partLabels as Record<string, string>)
+    : {};
+  const placeholders = cfg.partPlaceholders && typeof cfg.partPlaceholders === "object" && !Array.isArray(cfg.partPlaceholders)
+    ? (cfg.partPlaceholders as Record<string, string>)
+    : {};
+
+  const answer =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : {};
+
+  function setPart(k: string, v: string) {
+    if (disabled) return;
+    const next: Record<string, string> = {};
+    for (const key of parts) {
+      const current = typeof answer[key] === "string" ? (answer[key] as string) : "";
+      if (current.trim() !== "") next[key] = current;
+    }
+    if (v.trim() !== "") next[k] = v;
+    else delete next[k];
+    onChange(Object.keys(next).length === 0 ? undefined : next);
+  }
+
+  const partValue = (k: string): string =>
+    typeof answer[k] === "string" ? (answer[k] as string) : "";
+
+  return (
+    <div className="space-y-2.5">
+      <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+        {parts.map((p) => {
+          const meta = CONTACT_PART_META[p];
+          const label = typeof labels[p] === "string" && labels[p].trim() !== "" ? labels[p] : meta.label;
+          const ph =
+            typeof placeholders[p] === "string" && placeholders[p].trim() !== ""
+              ? placeholders[p]
+              : meta.placeholder;
+          const required = requiredParts.includes(p);
+          const partId = `${id}-${p}`;
+          return (
+            <div key={p} className={cn("space-y-1.5", (p === "first_name" || p === "email") && parts.length > 1 ? "" : "")}>
+              {p === "phone" ? (
+                <>
+                  <Label htmlFor={partId} className="text-xs">
+                    {label}
+                    {required && <span className="ml-0.5 text-[color:var(--memphis-coral)]" aria-label="required">*</span>}
+                  </Label>
+                  <PhoneControl
+                    id={partId}
+                    value={partValue(p) || undefined}
+                    onChange={(v) => setPart(p, typeof v === "string" ? v : "")}
+                    disabled={disabled}
+                    placeholder={ph || undefined}
+                    defaultCountry={cfg.defaultCountry}
+                  />
+                </>
+              ) : (
+                <>
+                  <Label htmlFor={partId} className="text-xs">
+                    {label}
+                    {required && <span className="ml-0.5 text-[color:var(--memphis-coral)]" aria-label="required">*</span>}
+                  </Label>
+                  <Input
+                    id={partId}
+                    type={p === "email" ? "email" : "text"}
+                    value={partValue(p)}
+                    onChange={(e) => setPart(p, e.target.value)}
+                    disabled={disabled}
+                    placeholder={ph || undefined}
+                    maxLength={p === "email" ? 320 : 200}
+                    autoComplete={meta.autoComplete}
+                  />
+                </>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* PaymentDisplay — the amount a respondent will be charged            */
+/*                                                                      */
+/* Display-only by design: charging runs through Stripe Checkout from  */
+/* the app's /api/payments/checkout route BEFORE the submission is     */
+/* stored, and submit_public_form verifies the succeeded payment row   */
+/* server-side. The control never claims a charge happened.            */
+/* ------------------------------------------------------------------ */
+
+function PaymentDisplay({
+  field,
+  cfg,
+  paymentRef,
+}: {
+  field: RenderableFormField;
+  cfg: Record<string, unknown>;
+  paymentRef?: string | null;
+}) {
+  const cents = intIn(cfg.amountCents, 50, 10_000_000) ?? 1000;
+  const currency = typeof cfg.currency === "string" ? cfg.currency : "USD";
+  const amountMode = cfg.amountMode === "minimum" ? "minimum" : "fixed";
+  const note = typeof cfg.paymentNote === "string" ? cfg.paymentNote : null;
+  const amount = new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency,
+    minimumFractionDigits: cents % 100 === 0 ? 0 : 2,
+  }).format(cents / 100);
+  const paid = typeof paymentRef === "string" && paymentRef !== "";
+
+  return (
+    <div
+      className="rounded-xl border-2 border-foreground/15 bg-background p-4"
+      role="group"
+      aria-label={`Payment ${field.label}`}
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <span
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[color:var(--memphis-violet)]/12 text-[color:var(--memphis-violet)]"
+            aria-hidden
+          >
+            <CreditCard className="h-4.5 w-4.5" />
+          </span>
+          <div>
+            <p className="font-display text-lg font-bold tabular-nums text-foreground">{amount}</p>
+            {amountMode === "minimum" && (
+              <p className="text-[11px] text-muted-foreground">minimum amount</p>
+            )}
+          </div>
+        </div>
+        {paid ? (
+          <span className="rounded-full bg-[color:var(--memphis-mint)]/15 px-2.5 py-1 text-[11px] font-semibold text-[color:var(--memphis-mint)]">
+            Payment received
+          </span>
+        ) : (
+          <span className="rounded-full bg-[color:var(--memphis-sun)]/15 px-2.5 py-1 text-[11px] font-semibold text-[color:var(--memphis-sun)]">
+            {field.is_required ? "Due at submit" : "Optional"}
+          </span>
+        )}
+      </div>
+      {note && <p className="mt-2 text-xs text-muted-foreground">{note}</p>}
+      {!paid && (
+        <p className="mt-2 text-[11px] leading-relaxed text-muted-foreground/80">
+          Secure checkout opens when you submit{field.is_required ? " — the payment must complete before your answers are stored" : ""}.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* SchedulerControl — date chips + slot grid                           */
+/*                                                                      */
+/* Slots are computed CLIENT-side in the field's configured timezone   */
+/* from config {days, windows, slotMinutes, minNoticeHours,            */
+/* maxBookingDays}; the answer is {start_at: ISO instant}. The server  */
+/* (008) re-derives and re-validates everything — this is UX only.     */
+/* ------------------------------------------------------------------ */
+
+/** Wall-clock parts of an instant, read in a given IANA timezone. */
+function wallPartsInZone(date: Date, tz: string): { y: number; m: number; d: number; hh: number; mm: number; dow: number } {
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short",
+  });
+  const parts: Record<string, string> = {};
+  for (const p of fmt.formatToParts(date)) parts[p.type] = p.value;
+  const DOW: Record<string, number> = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+  return {
+    y: Number(parts.year), m: Number(parts.month), d: Number(parts.day),
+    hh: Number(parts.hour === "24" ? "0" : parts.hour), mm: Number(parts.minute),
+    dow: DOW[parts.weekday ?? "Sun"] ?? 0,
+  };
+}
+
+/** Minutes a timezone is offset from UTC AT a given instant. */
+function tzOffsetMinutes(instant: Date, tz: string): number {
+  const p = wallPartsInZone(instant, tz);
+  const asUtc = Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm);
+  return Math.round((asUtc - instant.getTime()) / 60000);
+}
+
+/** Epoch ms for a wall-clock time in a timezone (two-pass offset). */
+function instantFromWall(y: number, m: number, d: number, hh: number, mm: number, tz: string): number {
+  const guess = Date.UTC(y, m - 1, d, hh, mm);
+  const off = tzOffsetMinutes(new Date(guess), tz);
+  const candidate = guess - off * 60000;
+  // Verify (DST edges can shift the wall time back); accept ±1 min slop.
+  const p = wallPartsInZone(new Date(candidate), tz);
+  const rebuilt = Date.UTC(p.y, p.m - 1, p.d, p.hh, p.mm);
+  if (Math.abs(rebuilt - candidate) <= 60000) return candidate;
+  return guess; // ambiguous wall time — fall back to the naive guess
+}
+
+const DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+function SchedulerControl({
+  id,
+  field,
+  cfg,
+  value,
+  onChange,
+  disabled,
+}: {
+  id: string;
+  field: RenderableFormField;
+  cfg: Record<string, unknown>;
+  value: unknown;
+  onChange: (v: unknown) => void;
+  disabled: boolean;
+}) {
+  const tz = typeof cfg.timezone === "string" && cfg.timezone ? cfg.timezone : "UTC";
+  const days = cfg.days && Array.isArray(cfg.days)
+    ? (cfg.days as unknown[]).filter((d): d is number => typeof d === "number" && d >= 0 && d <= 6)
+    : [1, 2, 3, 4, 5];
+  const windowsRaw = cfg.windows && Array.isArray(cfg.windows)
+    ? (cfg.windows as unknown[]).filter(
+        (w): w is { start: string; end: string } =>
+          typeof w === "object" && w !== null &&
+          typeof (w as { start?: unknown }).start === "string" &&
+          typeof (w as { end?: unknown }).end === "string",
+      )
+    : [];
+  const slotMinutes = intIn(cfg.slotMinutes, 5, 240) ?? 30;
+  const minNoticeHours = intIn(cfg.minNoticeHours, 0, 720) ?? 0;
+  const maxBookingDays = intIn(cfg.maxBookingDays, 1, 365) ?? 30;
+
+  const answer =
+    typeof value === "object" && value !== null && !Array.isArray(value)
+      ? (value as { start_at?: unknown })
+      : {};
+  const selected = typeof answer.start_at === "string" ? answer.start_at : null;
+
+  // Build the bookable day list (wall-clock dates in the field's tz).
+  const now = new Date();
+  const today = wallPartsInZone(now, tz);
+  const daysAhead: { y: number; m: number; d: number; dow: number; key: string; label: string; sub: string }[] = [];
+  for (let i = 0; i < Math.min(maxBookingDays, 60); i += 1) {
+    const dt = new Date(Date.UTC(today.y, today.m - 1, today.d + i, 12));
+    const p = wallPartsInZone(dt, tz);
+    if (!days.includes(p.dow)) continue;
+    daysAhead.push({
+      y: p.y, m: p.m, d: p.d, dow: p.dow,
+      key: `${p.y}-${String(p.m).padStart(2, "0")}-${String(p.d).padStart(2, "0")}`,
+      label: DOW_LABELS[p.dow],
+      sub: new Date(Date.UTC(p.y, p.m - 1, p.d)).toLocaleDateString(undefined, { month: "short", day: "numeric", timeZone: "UTC" }),
+    });
+  }
+
+  const [activeDay, setActiveDay] = useState<string | null>(null);
+  const active = daysAhead.find((d) => d.key === activeDay) ?? daysAhead[0] ?? null;
+
+  // Slots for the active day.
+  const slots: { iso: string; label: string }[] = [];
+  if (active) {
+    const earliest = now.getTime() + minNoticeHours * 3600_000;
+    for (const w of windowsRaw) {
+      const toMin = (s: string): number => Number(s.slice(0, 2)) * 60 + Number(s.slice(3, 5));
+      const from = toMin(w.start);
+      const to = toMin(w.end);
+      for (let m = from; m + slotMinutes <= to; m += slotMinutes) {
+        const hh = Math.floor(m / 60);
+        const mm = m % 60;
+        const epoch = instantFromWall(active.y, active.m, active.d, hh, mm, tz);
+        if (epoch < earliest) continue;
+        slots.push({
+          iso: new Date(epoch).toISOString(),
+          label: `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`,
+        });
+      }
+    }
+    slots.sort((a, b) => (a.iso < b.iso ? -1 : 1));
+  }
+
+  return (
+    <div className="space-y-3" role="group" aria-label={field.label}>
+      {/* Day picker */}
+      <div className="flex gap-1.5 overflow-x-auto pb-1" role="radiogroup" aria-label="Choose a day">
+        {daysAhead.map((d) => {
+          const isActive = active?.key === d.key;
+          return (
+            <button
+              key={d.key}
+              type="button"
+              role="radio"
+              aria-checked={isActive}
+              onClick={() => setActiveDay(d.key)}
+              disabled={disabled}
+              className={cn(
+                "flex min-w-[3.4rem] shrink-0 flex-col items-center rounded-xl border-2 px-2 py-1.5 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+                isActive
+                  ? "border-foreground bg-foreground text-background"
+                  : "border-foreground/15 bg-background text-foreground/80 hover:border-foreground/40",
+              )}
+            >
+              <span className="text-[10px] font-semibold uppercase tracking-wide">{d.label}</span>
+              <span className="text-xs font-medium">{d.sub}</span>
+            </button>
+          );
+        })}
+        {daysAhead.length === 0 && (
+          <p className="px-1 py-2 text-xs text-muted-foreground">
+            No bookable days in the next {maxBookingDays} days.
+          </p>
+        )}
+      </div>
+
+      {/* Slot grid */}
+      {active && (
+        <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label={`Times on ${active.key}`}>
+          {slots.map((s) => {
+            const isSelected = selected === s.iso;
+            return (
+              <button
+                key={s.iso}
+                type="button"
+                role="radio"
+                aria-checked={isSelected}
+                onClick={() => onChange(isSelected ? undefined : { start_at: s.iso })}
+                disabled={disabled}
+                className={cn(
+                  "h-9 rounded-lg border-2 px-3 text-sm font-semibold tabular-nums transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed",
+                  isSelected
+                    ? "border-foreground bg-foreground text-background"
+                    : "border-foreground/15 bg-background text-foreground/80 hover:border-foreground/40",
+                )}
+              >
+                {s.label}
+              </button>
+            );
+          })}
+          {slots.length === 0 && (
+            <p className="px-1 py-1.5 text-xs text-muted-foreground">
+              No available times on this day — try another.
+            </p>
+          )}
+        </div>
+      )}
+
+      {selected && (
+        <p className="text-xs text-muted-foreground" aria-live="polite">
+          Selected:{" "}
+          <span className="font-semibold text-foreground">
+            {new Date(selected).toLocaleString(undefined, { timeZoneName: "short" })}
+          </span>
+        </p>
+      )}
+      <p className="sr-only" id={`${id}-hint`}>
+        Slots are shown in the schedule timezone {tz}.
+      </p>
+      <p className="text-[11px] text-muted-foreground/80">
+        Times in {tz.replace("_", " ")}
+      </p>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /* FieldLabelBlock — shared label/description/help/error chrome        */
 /* ------------------------------------------------------------------ */
 
@@ -1322,6 +1865,8 @@ export function FieldRenderer({
   onChange,
   mode,
   idPrefix = "",
+  formPublicKey = "",
+  paymentRef,
 }: {
   field: RenderableFormField;
   value: unknown;
@@ -1330,23 +1875,37 @@ export function FieldRenderer({
   mode: FormRendererMode;
   /** Prepended to every input id — keeps canvas/preview/public DOM ids unique. */
   idPrefix?: string;
+  /** The public form key — threaded to the upload control. */
+  formPublicKey?: string;
+  /** Succeeded payment reference (public page only). */
+  paymentRef?: string | null;
 }) {
   // Section: a layout divider, never a data field. Always full width.
   if (field.field_type === "section") {
+    const align = field.config?.alignment === "center" ? "center" : "left";
+    const showDivider = field.config?.showDivider === true;
     return (
       <div className="form-field-cell py-2" style={{ "--field-w": 12 } as React.CSSProperties}>
-        <div className="flex items-center gap-2.5">
+        <div className={cn("flex items-center gap-2.5", align === "center" && "justify-center")}>
           <span className="inline-block h-2.5 w-2.5 rotate-45 bg-[color:var(--memphis-coral)]" aria-hidden />
           <h3 className="font-display text-lg font-bold text-foreground">{field.label}</h3>
         </div>
         {field.description && (
-          <p className="mt-1 text-sm text-muted-foreground">{field.description}</p>
+          <p className={cn("mt-1 text-sm text-muted-foreground", align === "center" && "text-center")}>{field.description}</p>
         )}
         {field.help_text && (
-          <p className="mt-0.5 text-xs text-muted-foreground/80">{field.help_text}</p>
+          <p className={cn("mt-0.5 text-xs text-muted-foreground/80", align === "center" && "text-center")}>{field.help_text}</p>
         )}
+        {showDivider && <hr className="mt-3 border-0 border-t border-foreground/15" />}
       </div>
     );
+  }
+
+  // Embed: a safe presentation block, never a data field. Videos from
+  // the YouTube/Vimeo allowlist render a sandboxed privacy player; any
+  // other URL renders as a link card. Never arbitrary HTML.
+  if (field.field_type === "embed") {
+    return <EmbedBlock field={field} mode={mode} />;
   }
 
   // Page break: a layout divider, never a data field. Always full width.
@@ -1395,8 +1954,111 @@ export function FieldRenderer({
           onChange={onChange}
           disabled={mode === "builder"}
           id={id}
+          mode={mode}
+          formPublicKey={formPublicKey}
+          paymentRef={paymentRef}
         />
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* EmbedBlock — allowlisted video player or safe link card             */
+/* ------------------------------------------------------------------ */
+
+const EMBED_ASPECT: Record<string, string> = {
+  "16:9": "16 / 9",
+  "4:3": "4 / 3",
+  "1:1": "1 / 1",
+};
+
+export function EmbedBlock({
+  field,
+  mode,
+}: {
+  field: RenderableFormField;
+  mode: FormRendererMode;
+}) {
+  const cfg = field.config ?? {};
+  const embedType = cfg.embedType === "link" ? "link" : "video";
+  const url = typeof cfg.url === "string" ? cfg.url : "";
+  const aspect = EMBED_ASPECT[typeof cfg.aspectRatio === "string" ? cfg.aspectRatio : "16:9"] ?? "16 / 9";
+  const linkText =
+    typeof cfg.linkText === "string" && cfg.linkText.trim() !== "" ? cfg.linkText : "Open link";
+  const video = embedType === "video" && url ? parseVideoEmbed(url) : null;
+  const title = field.label || "Embedded content";
+
+  if (!url) {
+    return (
+      <div className="form-field-cell py-2" style={{ "--field-w": 12 } as React.CSSProperties}>
+        <div className="flex items-center gap-2.5 rounded-xl border-2 border-dashed border-foreground/20 bg-background/60 p-4">
+          <FrameIcon className="h-5 w-5 shrink-0 text-muted-foreground/60" aria-hidden />
+          <div>
+            <p className="text-sm font-medium text-foreground/80">{title}</p>
+            <p className="text-xs text-muted-foreground">
+              {embedType === "video" ? "Add a YouTube or Vimeo link" : "Add a link"}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (video) {
+    return (
+      <div className="form-field-cell py-2" style={{ "--field-w": 12 } as React.CSSProperties}>
+        <div
+          className="overflow-hidden rounded-xl border-2 border-foreground/10 bg-background"
+          style={{ aspectRatio: aspect }}
+        >
+          <iframe
+            src={video.src}
+            title={title}
+            loading="lazy"
+            referrerPolicy="strict-origin-when-cross-origin"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+            allowFullScreen
+            sandbox="allow-scripts allow-same-origin allow-presentation allow-popups"
+            className="h-full w-full border-0"
+          />
+        </div>
+        {field.description && (
+          <p className="mt-1.5 text-sm text-muted-foreground">{field.description}</p>
+        )}
+      </div>
+    );
+  }
+
+  // Link card (also the fallback for non-allowlisted "video" URLs).
+  return (
+    <div className="form-field-cell py-2" style={{ "--field-w": 12 } as React.CSSProperties}>
+      <a
+        href={url}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="flex items-center gap-3 rounded-xl border-2 border-foreground/10 bg-background p-4 transition-colors hover:border-foreground/35 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        aria-label={`${linkText}: ${title}`}
+      >
+        <span
+          className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[color:var(--memphis-violet)]/12 text-[color:var(--memphis-violet)]"
+          aria-hidden
+        >
+          <ExternalLink className="h-4.5 w-4.5" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-semibold text-foreground">{title}</span>
+          <span className="block truncate text-xs text-muted-foreground">{url}</span>
+        </span>
+        {mode !== "builder" && (
+          <span className="shrink-0 text-xs font-semibold text-[color:var(--memphis-violet)]">
+            {linkText}
+          </span>
+        )}
+      </a>
+      {field.description && (
+        <p className="mt-1.5 text-sm text-muted-foreground">{field.description}</p>
+      )}
     </div>
   );
 }
@@ -1465,6 +2127,8 @@ export function FormRenderer({
   children,
   idPrefix = "",
   serverErrors,
+  formPublicKey = "",
+  paymentRef,
 }: {
   form: RenderableFormHeader;
   fields: RenderableFormField[];
@@ -1478,6 +2142,10 @@ export function FormRenderer({
   children?: ReactNode;
   /** Prepended to every input id — keeps DOM ids unique per context. */
   idPrefix?: string;
+  /** The public form's key — threaded to the file-upload control. */
+  formPublicKey?: string;
+  /** A succeeded payment reference (public page only). */
+  paymentRef?: string | null;
   /**
    * Server-side validation results from submit_public_form's
    * structured failure path (HTTP 200 + ok:false, per-field messages —
@@ -1498,6 +2166,12 @@ export function FormRenderer({
   /** 0 = welcome card, 1..N = field cards (sorted order). */
   const [step, setStep] = useState(0);
 
+  // Welcome screen (settings.welcome — presentation-only config that
+  // flows through the publish snapshot wholesale): respondent-facing
+  // surfaces start on the welcome; the builder canvas never does.
+  const welcome = mode !== "builder" ? readWelcomeSettings(form.settings) : null;
+  const [welcomeDismissed, setWelcomeDismissed] = useState(false);
+
   // Surface server-rejected answers (submit_public_form's structured
   // ok:false per-field messages) exactly like client-side errors; in
   // card mode also jump back to the first failing question; in paged
@@ -1510,8 +2184,17 @@ export function FormRenderer({
   >(null);
 
   const sorted = useMemo(() => [...fields].sort((a, b) => a.sort_order - b.sort_order), [fields]);
-  const total = sorted.length;
-  const currentField = step >= 1 && step <= total ? sorted[step - 1] : null;
+  // Card-mode steps: page breaks are MEANINGLESS in card mode (cards are
+  // already one-field-per-step — a page break would render as an empty
+  // divider card, which the user explicitly rejected). They are filtered
+  // OUT here; standard/paged mode keeps splitting at every break. The
+  // builder canvas always shows them (flat editing list).
+  const cardFields = useMemo(
+    () => sorted.filter((f) => f.field_type !== "page_break"),
+    [sorted],
+  );
+  const total = cardFields.length;
+  const currentField = step >= 1 && step <= total ? cardFields[step - 1] : null;
 
   // Paged standard presentation: page breaks split respondent views
   // into Back/Next pages (builder canvas stays the flat editing list;
@@ -1528,7 +2211,8 @@ export function FormRenderer({
     setShowErrors(true);
     const firstKey = Object.keys(serverErrors)[0];
     if (isCard) {
-      const idx = fields.findIndex((f) => f.field_key === firstKey);
+      // page_breaks are not card steps — index against cardFields.
+      const idx = cardFields.findIndex((f) => f.field_key === firstKey);
       if (idx >= 0) setStep(idx + 1);
     } else if (isPaged) {
       const pIdx = pages.findIndex((p) => p.some((f) => f.field_key === firstKey));
@@ -1570,7 +2254,7 @@ export function FormRenderer({
     // the respondent is leaving. The final step runs the full submit.
     if (isCard) {
       if (step < total) {
-        const f = sorted[step - 1];
+        const f = cardFields[step - 1];
         if (f) {
           const err = validateFieldValue(f, values[f.field_key]);
           setErrors(err ? { [f.field_key]: err } : {});
@@ -1619,7 +2303,7 @@ export function FormRenderer({
       el?.focus?.();
       if (isCard) {
         // Jump back to the first card that has a problem.
-        const idx = sorted.findIndex((f) => f.field_key === errorKeys[0]);
+        const idx = cardFields.findIndex((f) => f.field_key === errorKeys[0]);
         if (idx >= 0) setStep(idx + 1);
       }
       return;
@@ -1636,7 +2320,16 @@ export function FormRenderer({
     return (
       <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
         {step === 0 ? (
-          /* Welcome card — form title, description, Start */
+          /* Welcome card — form title, description, Start (or the
+             configured welcome screen when settings.welcome is on) */
+          welcome ? (
+            <WelcomeScreen
+              fallbackTitle={form.name}
+              fallbackDescription={form.description}
+              welcome={welcome}
+              onStart={() => setStep(1)}
+            />
+          ) : (
           <div className="flex min-h-[16rem] flex-col justify-center">
             <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
               {form.name}
@@ -1665,6 +2358,7 @@ export function FormRenderer({
               {total === 0 && submitNotice}
             </div>
           </div>
+          )
         ) : (
           <div className="flex min-h-[16rem] flex-col">
             {/* Progress */}
@@ -1690,7 +2384,8 @@ export function FormRenderer({
               </div>
             </div>
 
-            {/* The one field (sections render as statement cards) */}
+            {/* The one field (sections/embeds render as statement cards;
+                page breaks never reach card mode) */}
             {currentField && (
               <div key={currentField.field_key} className="flex-1">
                 <FieldRenderer
@@ -1700,6 +2395,8 @@ export function FormRenderer({
                   onChange={(v) => setValue(currentField.field_key, v)}
                   mode={mode}
                   idPrefix={idPrefix}
+                  formPublicKey={formPublicKey}
+                  paymentRef={paymentRef}
                 />
               </div>
             )}
@@ -1720,7 +2417,7 @@ export function FormRenderer({
                   ? "Submitting…"
                   : onLast
                     ? submitLabel
-                    : currentField?.field_type === "section" || currentField?.field_type === "page_break"
+                    : currentField?.field_type === "section" || currentField?.field_type === "embed"
                       ? "Continue"
                       : "Next"}
               </Button>
@@ -1749,6 +2446,15 @@ export function FormRenderer({
     const pct = Math.round(((safePage + 1) / pages.length) * 100);
     return (
       <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
+        {welcome && !welcomeDismissed && safePage === 0 ? (
+          <WelcomeScreen
+            fallbackTitle={form.name}
+            fallbackDescription={form.description}
+            welcome={welcome}
+            onStart={() => setWelcomeDismissed(true)}
+          />
+        ) : (
+        <>
         {/* Form header — what respondents see */}
         <header className="mb-6">
           <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
@@ -1793,6 +2499,8 @@ export function FormRenderer({
               onChange={(v) => setValue(field.field_key, v)}
               mode={mode}
               idPrefix={idPrefix}
+              formPublicKey={formPublicKey}
+              paymentRef={paymentRef}
             />
           ))}
         </div>
@@ -1823,6 +2531,8 @@ export function FormRenderer({
             {submitNotice}
           </div>
         )}
+        </>
+        )}
       </form>
     );
   }
@@ -1830,6 +2540,15 @@ export function FormRenderer({
   /* ---------------- Standard presentation ---------------- */
   return (
     <form onSubmit={handleSubmit} className={cn("w-full", className)} noValidate>
+      {welcome && !welcomeDismissed ? (
+        <WelcomeScreen
+          fallbackTitle={form.name}
+          fallbackDescription={form.description}
+          welcome={welcome}
+          onStart={() => setWelcomeDismissed(true)}
+        />
+      ) : (
+      <>
       {/* Form header — what respondents see */}
       <header className="mb-6">
         <h2 className="font-display text-2xl font-bold tracking-tight text-foreground sm:text-3xl">
@@ -1850,6 +2569,8 @@ export function FormRenderer({
             onChange={(v) => setValue(field.field_key, v)}
             mode={mode}
             idPrefix={idPrefix}
+            formPublicKey={formPublicKey}
+            paymentRef={paymentRef}
           />
         ))}
       </div>
@@ -1868,6 +2589,8 @@ export function FormRenderer({
           </Button>
           {submitNotice}
         </div>
+      )}
+      </>
       )}
     </form>
   );

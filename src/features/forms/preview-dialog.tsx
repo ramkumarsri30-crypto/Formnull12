@@ -25,6 +25,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { FormRenderer, type RenderableFormField, type RenderableFormHeader } from "./form-renderer";
+import { readThankYouSettings, ThankYouScreen } from "./welcome-thankyou";
 import { Monitor, Tablet, Smartphone, Info } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -48,6 +49,10 @@ export function PreviewDialog({
   fields: RenderableFormField[];
 }) {
   const [device, setDevice] = useState<Device>("desktop");
+  /** Preview-only thank-you state: submit shows the REAL screen the
+   *  respondent gets (no data is stored anywhere). */
+  const [showThankYou, setShowThankYou] = useState(false);
+  const thankyou = readThankYouSettings(form.settings);
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -98,7 +103,15 @@ export function PreviewDialog({
             className="mx-auto overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-4 shadow-[6px_6px_0_0_var(--memphis-ink)] transition-all duration-300 sm:p-8"
             style={{ width: DEVICE_WIDTHS[device], maxWidth: "100%" }}
           >
-            {fields.length === 0 ? (
+            {showThankYou && thankyou ? (
+              <ThankYouScreen
+                fallbackTitle="Thank you — response received"
+                fallbackDescription="This is what respondents see after submitting (preview — nothing was saved)."
+                thankyou={thankyou}
+                onBack={() => setShowThankYou(false)}
+                backLabel="Back to the preview form"
+              />
+            ) : fields.length === 0 ? (
               <p className="py-12 text-center text-sm text-muted-foreground">
                 This form has no fields yet — add fields to see them here.
               </p>
@@ -110,7 +123,12 @@ export function PreviewDialog({
                 mode="preview"
                 onSubmit={async () => {
                   /* Validation already ran (empty errors = valid). The
-                     preview deliberately does not persist anything. */
+                     preview deliberately does not persist anything — but
+                     it DOES show the real thank-you screen. */
+                  if (thankyou) {
+                    setShowThankYou(true);
+                    return;
+                  }
                   toast.info("Preview submit works — no response was saved.", {
                     description: "Publish the form to start collecting real answers.",
                   });

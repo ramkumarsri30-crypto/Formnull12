@@ -37,6 +37,11 @@ import {
   type RenderableFormField,
   type RenderableFormHeader,
 } from "./form-renderer";
+import {
+  readThankYouSettings,
+  readWelcomeSettings,
+  ThankYouScreen,
+} from "./welcome-thankyou";
 import { Check, Loader2, TriangleAlert, FileText } from "lucide-react";
 
 type Phase = "loading" | "error" | "ready" | "submitting" | "success";
@@ -108,6 +113,9 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
   });
   const [honeypot, setHoneypot] = useState("");
   const [submitError, setSubmitError] = useState<{ title: string; detail: string } | null>(null);
+  /** A Stripe payment reference for THIS form's payment field, captured
+   *  from the ?payment= return parameter after a checkout redirect. */
+  const [paymentRef, setPaymentRef] = useState<string | null>(null);
   /** Per-field messages from submit_public_form's structured failure
    *  path (HTTP 200 + ok:false — nothing was written). Threaded into
    *  the FormRenderer so they render with the same per-field error
@@ -155,17 +163,117 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
     void load();
   }, [load]);
 
+  // Stripe Checkout returns with ?payment={ref} on success — keep it
+  // for the submit flow (sessionStorage survives the redirect).
+  useEffect(() => {
+    try {
+      const url = new URL(window.location.href);
+      const ref = url.searchParams.get("payment");
+      if (ref && /^[A-Za-z0-9_-]{8,64}$/.test(ref)) {
+        setPaymentRef(ref);
+        sessionStorage.setItem(`formnull:payment:${publicKey}`, ref);
+        // Clean the URL so a refresh does not re-apply a stale param.
+        url.searchParams.delete("payment");
+        window.history.replaceState({}, "", url.toString());
+        return;
+      }
+      const stored = sessionStorage.getItem(`formnull:payment:${publicKey}`);
+      if (stored && /^[A-Za-z0-9_-]{8,64}$/.test(stored)) setPaymentRef(stored);
+    } catch {
+      /* URL APIs unavailable — payment return flow disabled */
+    }
+  }, [publicKey]);
+
+  /** Upload one signature drawing → private storage → answer token.
+   *  Runs only on the real public form (never in preview/builder). */
+  async function uploadSignature(fieldKey: string, dataUrl: string): Promise<unknown> {
+    const blob = await (await fetch(dataUrl)).blob();
+    const name = "signature.png";
+    const { data: intent, error: rpcError } = await supabaseBrowser.rpc(
+      "create_upload_intent",
+      {
+        p_public_key: publicKey,
+        p_field_key: fieldKey,
+        p_file_name: name,
+        p_mime_type: "image/png",
+        p_size_bytes: blob.size,
+      },
+    );
+    if (rpcError) throw rpcError;
+    const r = intent as { token?: string; path?: string } | null;
+    if (!r?.token || !r?.path) throw new Error("Upload intent returned no path.");
+    await new Promise<void>((resolve, reject) => {
+      const url = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/form-uploads/${r.path}`;
+      const xhr = new XMLHttpRequest();
+      xhr.open("PUT", url, true);
+      xhr.setRequestHeader("Authorization", `Bearer ${process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY}`);
+      xhr.setRequestHeader("apikey", process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "");
+      xhr.upload.onprogress = () => {
+        /* signature PNGs are small — no progress UI needed */
+      };
+      xhr.onerror = () => reject(new Error("Network error during signature upload."));
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new Error(`Storage rejected the signature (HTTP ${xhr.status}).`));
+      };
+      xhr.send(blob);
+    });
+    return r.token;
+  }
+
+  /**
+   * Start a Stripe Checkout session for a required payment field.
+   * The route is honest: without STRIPE_SECRET_KEY it refuses with
+   * PAYMENT_NOT_CONFIGURED (never a fake success). With keys, the
+   * respondent is redirected to Stripe and returns with ?payment=.
+   */
+  async function startPayment(fieldKey: string): Promise<"redirecting" | "error"> {
+    const ref = crypto.randomUUID();
+    try {
+      const res = await fetch("/api/payments/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ publicKey, fieldKey, paymentRef: ref }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (res.status === 200 && body.url) {
+        window.location.assign(body.url);
+        return "redirecting";
+      }
+      const code = body.error ?? "";
+      if (code === "PAYMENT_NOT_CONFIGURED") {
+        setSubmitError({
+          title: "Payment is not available on this form",
+          detail:
+            "The form owner has not finished payment configuration. Nothing was charged and your answers were not submitted — contact them for a working link.",
+        });
+      } else {
+        setSubmitError({
+          title: "Could not start payment",
+          detail: code || `The payment service responded with ${res.status}.`,
+        });
+      }
+      return "error";
+    } catch {
+      setSubmitError({
+        title: "Could not start payment",
+        detail: "A network error interrupted the checkout. Please try again.",
+      });
+      return "error";
+    }
+  }
+
   async function onSubmit(values: Record<string, unknown>) {
     // Client validation is UX only — strip keys with undefined (absent
-    // answers) and let 006 be the real authority.
+    // answers) and let the server be the real authority.
     const clean: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(values)) {
       if (v === undefined) continue;
       if (v === "") continue;
       clean[k] = v;
     }
-    // Defense-in-depth: never send unknown keys (006 rejects them).
-    // Registry-driven: only types submit_public_form accepts.
+    // Defense-in-depth: never send unknown keys (the server rejects
+    // them). Registry-driven: only types submit_public_form accepts.
     const known = new Set(
       state.fields.filter((f) => isSubmittableType(f.field_type)).map((f) => f.field_key),
     );
@@ -174,17 +282,57 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
       if (known.has(k)) payload[k] = v;
     }
 
+    // ── Signature fields: convert local drawings to storage tokens ──
+    for (const f of state.fields) {
+      if (f.field_type !== "signature") continue;
+      const v = payload[f.field_key];
+      if (typeof v === "string" && v.startsWith("data:image/png")) {
+        setState((s) => ({ ...s, phase: "submitting" }));
+        try {
+           
+          payload[f.field_key] = await uploadSignature(f.field_key, v);
+        } catch (e) {
+          setState((s) => ({ ...s, phase: "ready" }));
+          setSubmitError({
+            title: "Could not save the signature",
+            detail: e instanceof Error ? e.message : "Please draw it again and resubmit.",
+          });
+          return;
+        }
+      }
+    }
+
+    // ── Required payment: checkout must complete BEFORE storing ──
+    const paymentField = state.fields.find(
+      (f) => f.field_type === "payment" && f.is_required,
+    );
+    if (paymentField) {
+      if (!paymentRef) {
+        const outcome = await startPayment(paymentField.field_key);
+        if (outcome === "redirecting") {
+          // Leaving for Stripe — answers stay on the page via bfcache +
+          // the return parameter flow.
+          setState((s) => ({ ...s, phase: "ready" }));
+          return;
+        }
+        setState((s) => ({ ...s, phase: "ready" }));
+        return;
+      }
+    }
+
     setState((s) => ({ ...s, phase: "submitting" }));
     setSubmitError(null);
     try {
+      const meta: Record<string, unknown> = {
+        page_referrer: typeof document !== "undefined" ? document.referrer || null : null,
+        locale: typeof navigator !== "undefined" ? navigator.language : null,
+      };
+      if (paymentRef) meta.payment_ref = paymentRef;
       const { data, error } = await supabaseBrowser.rpc("submit_public_form", {
         p_public_key: publicKey,
         p_values: payload,
         p_honeypot: honeypot || null,
-        p_meta: {
-          page_referrer: typeof document !== "undefined" ? document.referrer || null : null,
-          locale: typeof navigator !== "undefined" ? navigator.language : null,
-        },
+        p_meta: meta,
       });
       if (error) {
         setSubmitError(submitErrorText(error.message));
@@ -285,7 +433,19 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
             </div>
           )}
 
-          {state.phase === "success" && (
+          {state.phase === "success" && (() => {
+            const thankyou = readThankYouSettings(state.form?.settings);
+            if (thankyou) {
+              return (
+                <ThankYouScreen
+                  fallbackTitle="Thank you — response received"
+                  fallbackDescription={`${state.form?.name ?? "Your response"} has been recorded. You can close this page.`}
+                  thankyou={thankyou}
+                  reference={state.reference}
+                />
+              );
+            }
+            return (
             <div
               className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-8 text-center shadow-[6px_6px_0_0_var(--memphis-ink)]"
               role="status"
@@ -310,7 +470,8 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
                 {state.form?.name} has been recorded. You can close this page.
               </p>
             </div>
-          )}
+            );
+          })()}
 
           {(state.phase === "ready" || state.phase === "submitting") && state.form && (
             <div className="relative overflow-hidden rounded-2xl border-2 border-foreground/10 bg-surface p-5 shadow-[6px_6px_0_0_var(--memphis-ink)] sm:p-8">
@@ -348,6 +509,8 @@ export function PublicForm({ publicKey }: { publicKey: string }) {
                 onSubmit={onSubmit}
                 submitting={state.phase === "submitting"}
                 serverErrors={serverErrors ?? undefined}
+                formPublicKey={publicKey}
+                paymentRef={paymentRef}
               />
             </div>
           )}

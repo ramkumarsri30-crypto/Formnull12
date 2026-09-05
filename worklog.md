@@ -317,3 +317,20 @@ Stage Summary:
 - Migration 008 is COMPLETE and validated but NOT applied (owner protocol: paste into Supabase SQL editor); the builder auto-detects the apply via a runtime probe and activates the 6 types + their library entries with zero code changes
 - Payment honesty: without STRIPE_SECRET_KEY the checkout route returns PAYMENT_NOT_CONFIGURED, the public form shows the error, and submit_public_form's server-side gate rejects required-payment submissions — no fake success anywhere
 - Existing data fully preserved: no migration files touched, QA cleanup surgically removed only phase-12 rows
+---
+Task ID: 12
+Agent: Main agent (Super Z)
+Task: Push completed field-expansion code to GitHub main (Formnull12)
+
+Work Log:
+- Verified git state: main @ c7f4432, ahead 2 of origin/main (a3a0556 QA artifacts + c7f4432 field expansion), working tree clean
+- Confirmed user applied migration 008 to Supabase successfully; Stripe keys deferred by user (optional, honest not-configured states remain)
+- SECRET SCAN (pre-push): .env/.env.local gitignored (`.env*` with `!.env.example`); no real key values (sb_secret_*/sb_publishable_*/sk_*/whsec_*/ghp_/github_pat_/JWTs) in any tracked file — only masked mentions in worklog/tool-results and commented placeholders in .env.example; no env/credential files tracked
+- Verified migrations 001-007 byte-identical to origin; 008 is new file only; zero files deleted vs origin; 110 files changed, +10579/-315 across the 2 commits
+- Push attempts failed: no GitHub credentials in sandbox (no token/SSH/gh CLI) — needs user PAT
+- Created fallback: download/formnull12-push.bundle (24MB thin bundle 7a9dccb..c7f4432), verified + round-trip tested (simulated GitHub clone → bundle pull → lands exactly at c7f4432 with all new files: 008_field_expansion.sql, api routes, 10-field implementation)
+- Dev server health-checked: landing 200, public form endpoint responding
+
+Stage Summary:
+- Code is push-ready and secret-clean; bundle fallback at download/formnull12-push.bundle
+- Remaining: actual `git push origin main` — blocked only on GitHub authorization (user can paste a fine-grained/classic PAT with repo Contents Read+Write for Formnull12, or run: git pull formnull12-push.bundle main && git push origin main from their own clone)
